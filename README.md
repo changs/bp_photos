@@ -18,7 +18,9 @@ Works on macOS and Linux.
 - Suggests about a dozen presets per photo. Every preset is rendered small and scored for clipping,
   exposure, contrast, saturation and skin tones; hover a suggestion to see why it was picked.
 - Amount slider (0–150%), or scroll over the photo.
-- Before/after view, or hold the mouse on the photo to see the original.
+- Before/after view, or hold the mouse on the photo to see the original. Zoom to 100% to check
+  grain and sharpness.
+- Step through the photos in a folder; the next and previous ones are decoded in the background.
 - Crop with aspect ratios (free, original, 1:1, 4:5, 2:3, 16:9).
 - Export at full size or for Instagram, X, Facebook or a custom size, as JPEG, PNG or TIFF.
   Or copy to the clipboard. JPEG and PNG exports keep the date, camera, lens and exposure info,
@@ -44,6 +46,8 @@ cargo run --release -- photo.jpg
 | | |
 |---|---|
 | arrows | move through presets |
+| `[` / `]` | previous / next photo in the folder (preloaded, so it's instant) |
+| `Z` or double-click | 100% view, drag to pan (both sides in before/after) |
 | scroll | change amount |
 | `\` (hold) | show original |
 | `Y` | before / after |

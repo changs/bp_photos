@@ -1,4 +1,5 @@
 mod app;
+mod browse;
 mod cli;
 mod crop;
 mod export;

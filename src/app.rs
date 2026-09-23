@@ -67,6 +67,14 @@ struct ExportSettings {
 
 const FORMATS: [(&str, &str); 3] = [("JPEG", "jpg"), ("PNG", "png"), ("TIFF", "tif")];
 
+/// Render targets for the 100% view: the visible region of the photo, edited and original.
+struct ZoomViews {
+    size: (u32, u32),
+    region: Crop,
+    edited: (Target, TextureId),
+    original: (Target, TextureId),
+}
+
 /// State of the crop tool while it's open.
 struct CropEdit {
     /// Crop to restore on cancel.
@@ -120,6 +128,17 @@ pub struct PhotoApp {
     nav_cells: Vec<(usize, String, Rect)>,
     /// Section the selection was made in (a preset can appear in "Recommended" and its group).
     selected_section: String,
+    egui_ctx: egui::Context,
+    /// 100% view: the point of the photo (normalised coordinates) at the centre of the view.
+    zoom: Option<[f32; 2]>,
+    /// Drag-to-pan: pointer position and zoom centre when the drag began.
+    zoom_drag: Option<(egui::Pos2, [f32; 2])>,
+    zoom_views: Option<ZoomViews>,
+    zoom_dirty: bool,
+    /// The folder of the current photo, for stepping to the previous/next one.
+    browser: crate::browse::Browser,
+    /// The photo most recently asked for (it may still be loading).
+    target: Option<PathBuf>,
     /// Presets recommended for the current photo, best first.
     recs: Vec<crate::recommend::Rec>,
     /// Recommendations need recomputing (new photo, crop or presets).
@@ -190,6 +209,13 @@ impl PhotoApp {
             thumb_queue: Vec::new(),
             opened_at: None,
             recs: Vec::new(),
+            egui_ctx: cc.egui_ctx.clone(),
+            zoom: None,
+            zoom_drag: None,
+            zoom_views: None,
+            zoom_dirty: false,
+            browser: crate::browse::Browser::new(),
+            target: None,
             nav_cells: Vec::new(),
             screenshot: std::env::var_os("BP_PHOTOS_SCREENSHOT").map(|p| (PathBuf::from(p), 0)),
             selected_section: String::new(),
@@ -221,6 +247,9 @@ impl PhotoApp {
     }
 
     fn open(&mut self, path: PathBuf, ctx: &egui::Context) {
+        self.browser.index(&path);
+        self.browser.pending = None;
+        self.target = Some(path.clone());
         let (tx, rx) = channel();
         let max = self.gpu.max_dim();
         let ctx = ctx.clone();
@@ -236,6 +265,118 @@ impl PhotoApp {
             ctx.request_repaint();
         });
         self.loading = Some(rx);
+    }
+
+    fn zoom_available(&self) -> bool {
+        self.photo.as_ref().is_some_and(|p| !p.provisional) && self.cropping.is_none()
+    }
+
+    /// Turns the 100% view on (centred on `at`, or the middle of the crop) or off.
+    fn toggle_zoom(&mut self, at: Option<[f32; 2]>) {
+        if self.zoom.is_some() {
+            self.zoom = None;
+            self.zoom_drag = None;
+            if let Some(z) = self.zoom_views.take() {
+                let mut renderer = self.renderer.write();
+                renderer.free_texture(&z.edited.1);
+                renderer.free_texture(&z.original.1);
+            }
+        } else if self.zoom_available()
+            && let Some(photo) = &self.photo
+        {
+            let c = photo.crop;
+            self.zoom = Some(at.unwrap_or([(c[0] + c[2]) / 2.0, (c[1] + c[3]) / 2.0]));
+        }
+    }
+
+    /// The 100% view: one photo pixel per screen pixel, dragged to pan.
+    fn zoom_view(&mut self, ui: &mut egui::Ui, rect: Rect, response: &egui::Response) -> Rect {
+        let photo = self.photo.as_ref().unwrap();
+        let (size, crop) = (photo.size(), photo.crop);
+        let ppp = ui.ctx().pixels_per_point();
+        let area = rect.shrink(12.0);
+        let cells = if self.side_by_side {
+            let w = (area.width() - 12.0) / 2.0;
+            let left = Rect::from_min_size(area.min, Vec2::new(w, area.height()));
+            vec![left, left.translate(Vec2::new(w + 12.0, 0.0))]
+        } else {
+            vec![area]
+        };
+
+        // Pan: dragging moves the photo with the pointer.
+        let mut center = self.zoom.unwrap();
+        if response.drag_started()
+            && let Some(p) = ui.input(|i| i.pointer.press_origin())
+        {
+            self.zoom_drag = Some((p, center));
+        }
+        if let Some((origin, start)) = self.zoom_drag {
+            if let Some(p) = response.interact_pointer_pos() {
+                let d = (p - origin) * ppp;
+                center = [start[0] - d.x / size.0 as f32, start[1] - d.y / size.1 as f32];
+            }
+            if !response.dragged() {
+                self.zoom_drag = None;
+            }
+        }
+        let cell_px = (cells[0].width() * ppp, cells[0].height() * ppp);
+        let (region, center) = zoom_region(center, cell_px, size, crop);
+        self.zoom = Some(center);
+        let px = crop::pixel_size(region, size);
+
+        if self.zoom_views.as_ref().is_none_or(|z| z.size != px) {
+            let (edited, original) = (self.new_view(px), self.new_view(px));
+            if let Some(old) = self.zoom_views.replace(ZoomViews { size: px, region, edited, original }) {
+                let mut renderer = self.renderer.write();
+                renderer.free_texture(&old.edited.1);
+                renderer.free_texture(&old.original.1);
+            }
+            self.zoom_dirty = true;
+        }
+        let z = self.zoom_views.as_mut().unwrap();
+        if z.region != region {
+            z.region = region;
+            self.zoom_dirty = true;
+        }
+
+        let painter = ui.painter_at(rect);
+        let uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        let snap = |p: egui::Pos2| egui::pos2((p.x * ppp).round() / ppp, (p.y * ppp).round() / ppp);
+        let shown = |cell: Rect| {
+            let r = Rect::from_center_size(cell.center(), Vec2::new(px.0 as f32, px.1 as f32) / ppp);
+            Rect::from_min_size(snap(r.min), r.size())
+        };
+        let name = &self.presets[self.selected].name;
+        let after = shown(*cells.last().unwrap());
+        painter.image(z.edited.1, after, uv, Color32::WHITE);
+        if self.side_by_side {
+            let before = shown(cells[0]);
+            painter.image(z.original.1, before, uv, Color32::WHITE);
+            badge(&painter, before, "Before · 100%");
+            badge(&painter, after, &format!("{name} · 100%"));
+        } else {
+            badge(&painter, after, if self.show_original { "Original · 100%" } else { "100%" });
+        }
+        ui.ctx().set_cursor_icon(if self.zoom_drag.is_some() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+        after
+    }
+
+    /// Steps to the previous (-1) or next (+1) photo in the folder. Preloaded neighbours show
+    /// immediately; one still preloading is picked up when it's ready.
+    fn navigate(&mut self, delta: isize, ctx: &egui::Context) {
+        let Some(current) = self.target.clone() else { return };
+        let Some(next) = self.browser.neighbour(&current, delta) else { return };
+        self.target = Some(next.clone());
+        self.loading = None;
+        self.browser.pending = None;
+        if let Some(decoded) = self.browser.take(&next) {
+            self.finish_load(next, decoded, Instant::now(), false);
+        } else if self.browser.is_inflight(&next) {
+            self.status = format!("Loading {}…", next.display());
+            self.browser.pending = Some(next);
+        } else {
+            self.open(next, ctx);
+        }
     }
 
     /// Creates a render target and registers it with egui.
@@ -281,6 +422,7 @@ impl PhotoApp {
         self.preview_dirty = true;
         self.original_dirty = true;
         self.recs_dirty = true;
+        self.zoom_dirty = true;
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let ms = start.elapsed().as_millis();
         self.status = if provisional {
@@ -289,6 +431,10 @@ impl PhotoApp {
             format!("{name} — {}×{} — loaded in {ms} ms", size.0, size.1)
         };
         self.opened_at = Some((start, provisional));
+        if !provisional {
+            let ctx = self.egui_ctx.clone();
+            self.browser.prefetch(&path, self.gpu.max_dim(), &ctx);
+        }
     }
 
     /// Resizes the preview and thumbnail targets when the displayed crop changes.
@@ -364,7 +510,7 @@ impl PhotoApp {
     /// Renders whatever is out of date, in a single GPU submission.
     fn render(&mut self) {
         self.sync_targets();
-        if self.photo.is_none() || !(self.preview_dirty || self.original_dirty || !self.thumb_queue.is_empty()) {
+        if self.photo.is_none() || !(self.preview_dirty || self.original_dirty || self.zoom_dirty || !self.thumb_queue.is_empty()) {
             return;
         }
         let photo = self.photo.as_ref().unwrap();
@@ -381,6 +527,15 @@ impl PhotoApp {
         let strength = if self.show_original { 0.0 } else { self.strength };
         let preset = &self.gpu_presets[self.selected];
         self.gpu.render(&mut encoder, &photo.source, preset, &photo.preview, strength, photo.view_crop);
+        if let Some(z) = &self.zoom_views
+            && (self.zoom_dirty || self.preview_dirty)
+        {
+            self.gpu.render(&mut encoder, &photo.source, preset, &z.edited.0, strength, z.region);
+            if self.zoom_dirty {
+                self.gpu.render(&mut encoder, &photo.source, &self.gpu_presets[0], &z.original.0, 0.0, z.region);
+            }
+        }
+        self.zoom_dirty = false;
         self.gpu.queue.submit([encoder.finish()]);
         if let Some((start, quick)) = self.opened_at.take() {
             let what = if quick { "open → quick preview frame" } else { "open → full image frame" };
@@ -391,6 +546,9 @@ impl PhotoApp {
     }
 
     fn start_crop(&mut self) {
+        if self.zoom.is_some() {
+            self.toggle_zoom(None);
+        }
         if let Some(photo) = &self.photo {
             self.cropping = Some(CropEdit { before: photo.crop, drag: None });
             self.side_by_side = false;
@@ -748,6 +906,15 @@ impl PhotoApp {
     }
 
     fn poll_background(&mut self, ctx: &egui::Context) {
+        if let Some((path, result)) = self.browser.poll() {
+            match result {
+                Ok(decoded) => self.finish_load(path, decoded, Instant::now(), false),
+                Err(e) => self.status = format!("Could not open {}: {e}", path.display()),
+            }
+        }
+        if self.browser.busy() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
         while let Some(msg) = self.loading.as_ref().and_then(|rx| rx.try_recv().ok()) {
             if !msg.quick {
                 self.loading = None;
@@ -833,6 +1000,18 @@ impl PhotoApp {
         if ctx.input(|i| plain_key(i, Key::C)) {
             self.start_crop();
         }
+        if ctx.input(|i| plain_key(i, Key::Z)) {
+            self.toggle_zoom(None);
+        }
+        if self.zoom.is_some() && ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.toggle_zoom(None);
+        }
+        if ctx.input(|i| plain_key(i, Key::OpenBracket)) {
+            self.navigate(-1, ctx);
+        }
+        if ctx.input(|i| plain_key(i, Key::CloseBracket)) {
+            self.navigate(1, ctx);
+        }
         if ctx.input(|i| plain_key(i, Key::Y)) {
             self.side_by_side = !self.side_by_side;
         }
@@ -872,6 +1051,19 @@ impl PhotoApp {
                     self.open(path, ui.ctx());
                 }
             }
+            if let Some(target) = self.target.clone()
+                && let Some(pos) = self.browser.position(&target)
+            {
+                let count = self.browser.files.len();
+                if ui.add_enabled(pos > 0, egui::Button::new("◀")).on_hover_text("Previous photo ([)").clicked() {
+                    self.navigate(-1, ui.ctx());
+                }
+                ui.label(egui::RichText::new(format!("{} / {count}", pos + 1)).weak());
+                if ui.add_enabled(pos + 1 < count, egui::Button::new("▶")).on_hover_text("Next photo (])").clicked() {
+                    self.navigate(1, ui.ctx());
+                }
+                ui.separator();
+            }
             let can_export = self.photo.as_ref().is_some_and(|p| !p.provisional) && self.exporting.is_none();
             if ui.add_enabled(can_export, egui::Button::new("💾 Export…")).on_hover_text("Export (⌘E / Ctrl+E)").clicked() {
                 self.export_dialog = true;
@@ -910,6 +1102,10 @@ impl PhotoApp {
             ui.add_enabled_ui(self.cropping.is_none(), |ui| {
                 ui.toggle_value(&mut self.side_by_side, "◫ Before / After").on_hover_text("Show the original next to the edit (Y)");
             });
+            let zoomed = self.zoom.is_some();
+            if ui.add_enabled(self.zoom_available(), egui::Button::selectable(zoomed, "🔍 100%")).on_hover_text("Zoom to 100% (Z, or double-click the photo)").clicked() {
+                self.toggle_zoom(None);
+            }
             let mut cropping = self.cropping.is_some();
             if ui.add_enabled(self.photo.is_some(), egui::Button::selectable(cropping, "✂ Crop")).on_hover_text("Crop the photo (C)").clicked() {
                 cropping = !cropping;
@@ -1074,9 +1270,19 @@ impl PhotoApp {
             self.crop_view(ui, rect, &response);
             return;
         }
+        if self.zoom.is_some() && !self.zoom_available() {
+            // e.g. the next photo is still showing its quick preview: show it fitted meanwhile.
+            self.zoom_views = None;
+        }
+        let zoomed = self.zoom.is_some() && self.zoom_available();
         let painter = ui.painter_at(rect);
         let mut edited_rect = None;
+        // Where on screen the (fitted) photo is, for double-click-to-zoom: (rect, crop shown).
+        let mut fitted: Option<(Rect, Crop)> = None;
         match &self.photo {
+            Some(_) if zoomed => {
+                edited_rect = Some(self.zoom_view(ui, rect, &response));
+            }
             Some(photo) if self.side_by_side => {
                 let size = (photo.preview.width, photo.preview.height);
                 let (before, after) = split_for(rect.shrink(12.0), size, 12.0);
@@ -1087,6 +1293,7 @@ impl PhotoApp {
                 badge(&painter, b, "Before");
                 badge(&painter, a, &self.presets[self.selected].name);
                 edited_rect = Some(a);
+                fitted = Some((a, photo.view_crop));
             }
             Some(photo) => {
                 let r = fit_rect(rect.shrink(12.0), (photo.preview.width, photo.preview.height));
@@ -1095,6 +1302,7 @@ impl PhotoApp {
                     badge(&painter, r, "Original");
                 }
                 edited_rect = Some(r);
+                fitted = Some((r, photo.view_crop));
             }
             None => {
                 let text = if self.loading.is_some() { "Loading…" } else { "Drop a photo here, or click Open.\nDrop .xmp / .lrtemplate / .cube files to import presets." };
@@ -1121,33 +1329,75 @@ impl PhotoApp {
             }
         }
 
-        let original = !self.side_by_side && (response.is_pointer_button_down_on() || ui.input(|i| i.key_down(Key::Backslash)));
+        // Double-click zooms to 100% at that spot, or back out.
+        if response.double_clicked() && self.photo.is_some() {
+            let at = fitted.zip(response.interact_pointer_pos()).filter(|((r, _), p)| r.contains(*p)).map(|((r, c), p)| {
+                let u = (p - r.min) / r.size();
+                [c[0] + u.x * (c[2] - c[0]), c[1] + u.y * (c[3] - c[1])]
+            });
+            self.toggle_zoom(at);
+        }
+        // Holding the mouse shows the original, except at 100% where dragging pans.
+        let held = response.is_pointer_button_down_on() && !zoomed;
+        let original = !self.side_by_side && (held || ui.input(|i| i.key_down(Key::Backslash)));
         if original != self.show_original {
             self.show_original = original;
             self.preview_dirty = true;
         }
         if self.amount_changed_at.is_none() {
-            response.on_hover_text("Scroll to change the amount · hold the mouse button (or \\) to see the original");
+            let tip = if zoomed {
+                "Drag to pan · double-click or Z for the whole photo · hold \\ to see the original"
+            } else {
+                "Scroll to change the amount · hold the mouse button (or \\) to see the original · double-click or Z for 100%"
+            };
+            response.on_hover_text(tip);
         }
     }
 }
 
 impl PhotoApp {
+    /// `BP_PHOTOS_TOUR=1`: step to the next photo every 1.5 s and quit at the end of the folder
+    /// (with `BP_PHOTOS_TIMING`, measures real navigation, preloading included).
+    fn drive_tour(&mut self, ctx: &egui::Context) {
+        if std::env::var_os("BP_PHOTOS_TOUR").is_none() {
+            return;
+        }
+        let now = ctx.input(|i| i.time);
+        let last = ctx.data_mut(|d| *d.get_temp_mut_or(egui::Id::new("tour"), now));
+        if now - last > 1.5 && self.photo.as_ref().is_some_and(|p| !p.provisional) {
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("tour"), now));
+            let at_end = self.target.as_ref().and_then(|t| self.browser.neighbour(t, 1)).is_none();
+            if at_end {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                eprintln!("tour: next photo");
+                self.navigate(1, ctx);
+            }
+        }
+        ctx.request_repaint();
+    }
+
     fn drive_screenshot(&mut self, ctx: &egui::Context) {
-        let Some((path, frames)) = &mut self.screenshot else { return };
+        let Some((_, frames)) = &self.screenshot else { return };
         // Full image loaded and its recommendations settled (not the quick preview's).
         let settled = !self.recs_dirty && self.recs_job.is_none() && self.recs_rx.is_none();
         let ready = self.photo.as_ref().is_some_and(|p| !p.provisional) && !self.recs.is_empty() && settled;
+        let frames = if ready { frames + 1 } else { *frames };
+        if let Some((_, f)) = &mut self.screenshot {
+            *f = frames;
+        }
         if ready {
-            *frames += 1;
-            if *frames == 1 {
+            if frames == 1 {
                 self.selected_section = "recommended".into();
                 self.selected = self.recs[0].index;
                 self.preview_dirty = true;
                 self.side_by_side = std::env::var_os("BP_PHOTOS_SCREENSHOT_COMPARE").is_some();
+                if std::env::var_os("BP_PHOTOS_SCREENSHOT_ZOOM").is_some() {
+                    self.toggle_zoom(Some([0.62, 0.45]));
+                }
             }
             // A few frames for thumbnails to render, then capture.
-            if *frames == 12 {
+            if frames == 12 {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
             }
         }
@@ -1157,7 +1407,9 @@ impl PhotoApp {
                 _ => None,
             })
         });
-        if let Some(image) = shot {
+        if let Some(image) = shot
+            && let Some((path, _)) = &self.screenshot
+        {
             let [w, h] = image.size;
             let rgba = image::RgbaImage::from_raw(w as u32, h as u32, image.as_raw().to_vec());
             match rgba.map(|img| img.save(&*path)) {
@@ -1174,6 +1426,7 @@ impl eframe::App for PhotoApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.drive_screenshot(&ctx);
+        self.drive_tour(&ctx);
         self.poll_background(&ctx);
 
         let filter = self.filter.to_lowercase();
@@ -1210,6 +1463,18 @@ impl eframe::App for PhotoApp {
 /// A single-letter shortcut, pressed without ⌘/Ctrl/Alt (so ⌘C copies rather than crops).
 fn plain_key(i: &egui::InputState, key: Key) -> bool {
     i.key_pressed(key) && !i.modifiers.command && !i.modifiers.ctrl && !i.modifiers.alt
+}
+
+/// The region of the photo shown at 100% in a view of `view_px` screen pixels, centred as close
+/// to `center` as the crop allows. Returns the region and the (clamped) centre.
+fn zoom_region(center: [f32; 2], view_px: (f32, f32), image: (u32, u32), within: Crop) -> (Crop, [f32; 2]) {
+    let rw = (view_px.0 / image.0 as f32).min(within[2] - within[0]);
+    let rh = (view_px.1 / image.1 as f32).min(within[3] - within[1]);
+    // Not `clamp`: when the view spans the whole crop, rounding can put min a hair above max.
+    let fit = |v: f32, lo: f32, hi: f32| if lo >= hi { (lo + hi) / 2.0 } else { v.max(lo).min(hi) };
+    let cx = fit(center[0], within[0] + rw / 2.0, within[2] - rw / 2.0);
+    let cy = fit(center[1], within[1] + rh / 2.0, within[3] - rh / 2.0);
+    ([cx - rw / 2.0, cy - rh / 2.0, cx + rw / 2.0, cy + rh / 2.0], [cx, cy])
 }
 
 /// Next cell for arrow keys `[left, right, up, down]`, over cells in display order: left/right
@@ -1335,6 +1600,20 @@ mod tests {
     fn cells() -> Vec<Rect> {
         let cell = |x: f32, y: f32| Rect::from_min_size(egui::pos2(x, y), Vec2::new(100.0, 80.0));
         vec![cell(0.0, 0.0), cell(110.0, 0.0), cell(0.0, 90.0), cell(110.0, 90.0), cell(0.0, 210.0), cell(110.0, 210.0)]
+    }
+
+    #[test]
+    fn zoom_region_is_one_to_one_and_stays_inside_the_crop() {
+        // 1000×500 view on a 4000×2000 photo: a quarter of each side, one pixel per pixel.
+        let (r, c) = zoom_region([0.5, 0.5], (1000.0, 500.0), (4000, 2000), FULL_CROP);
+        assert_eq!(r, [0.375, 0.375, 0.625, 0.625]);
+        assert_eq!(c, [0.5, 0.5]);
+        // Panned past the corner: clamped so the view stays on the photo.
+        let (r, _) = zoom_region([0.0, 1.0], (1000.0, 500.0), (4000, 2000), FULL_CROP);
+        assert_eq!(r, [0.0, 0.75, 0.25, 1.0]);
+        // View bigger than a small crop: shows the whole crop.
+        let (r, _) = zoom_region([0.5, 0.5], (4000.0, 4000.0), (4000, 2000), [0.2, 0.2, 0.4, 0.6]);
+        assert!(r.iter().zip([0.2, 0.2, 0.4, 0.6]).all(|(a, b)| (a - b).abs() < 1e-6), "{r:?}");
     }
 
     #[test]
