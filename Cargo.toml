@@ -10,6 +10,7 @@ dirs = "7.0.0"
 eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11", "persistence"] }
 half = "2.7.1"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
+kamadak-exif = "0.6"
 libheif-rs = "3"
 pollster = "1.0.1"
 quick-xml = "0.42.0"

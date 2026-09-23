@@ -61,6 +61,8 @@ struct ExportSettings {
     /// 0 = JPEG, 1 = PNG, 2 = TIFF.
     format: usize,
     quality: u8,
+    /// Copy the photo's GPS position into the export.
+    keep_gps: bool,
 }
 
 const FORMATS: [(&str, &str); 3] = [("JPEG", "jpg"), ("PNG", "png"), ("TIFF", "tif")];
@@ -182,7 +184,7 @@ impl PhotoApp {
             crop_flip: false,
             amount_changed_at: None,
             export_dialog: false,
-            export_settings: ExportSettings { size: 0, custom_edge: 2560, fill: true, format: 0, quality: 92 },
+            export_settings: ExportSettings { size: 0, custom_edge: 2560, fill: true, format: 0, quality: 92, keep_gps: true },
             preview_dirty: false,
             original_dirty: false,
             thumb_queue: Vec::new(),
@@ -639,6 +641,12 @@ impl PhotoApp {
                     ui.add(egui::Slider::new(&mut st.quality, 50..=100));
                     ui.end_row();
                 }
+                if st.format != 2 {
+                    ui.label("Metadata");
+                    ui.checkbox(&mut st.keep_gps, "Keep location")
+                        .on_hover_text("Date, camera and exposure details are always kept.\nUntick to leave out where the photo was taken.");
+                    ui.end_row();
+                }
             });
             ui.add_space(8.0);
             let (w, h) = plan.output;
@@ -722,13 +730,15 @@ impl PhotoApp {
         let start = Instant::now();
         let (w, h) = plan.render;
         let quality = st.quality;
+        let (source, keep_gps) = (photo.path.clone(), st.keep_gps);
         match self.gpu.render_image(&photo.source, &self.gpu_presets[self.selected], self.strength, plan.crop, w, h) {
             Ok(img) => {
                 let (tx, rx) = channel();
                 self.status = format!("Exporting {}…", dest.display());
                 std::thread::spawn(move || {
                     let img = resize(img, plan.output);
-                    _ = tx.send(save_image(&img, &dest, quality).map(|_| dest));
+                    let exif = crate::metadata::for_export(&source, img.dimensions(), keep_gps);
+                    _ = tx.send(save_image(&img, &dest, quality, exif).map(|_| dest));
                 });
                 self.exporting = Some(rx);
                 log_time("render full-res", start);
@@ -1279,14 +1289,30 @@ pub fn resize(img: image::RgbImage, size: (u32, u32)) -> image::RgbImage {
     }
 }
 
-pub fn save_image(img: &image::RgbImage, dest: &Path, jpeg_quality: u8) -> Result<(), String> {
+/// Saves as JPEG, PNG or TIFF (by extension), with `exif` embedded where the format allows
+/// (JPEG and PNG).
+pub fn save_image(img: &image::RgbImage, dest: &Path, jpeg_quality: u8, exif: Option<Vec<u8>>) -> Result<(), String> {
+    use image::ImageEncoder;
+
+    let err = |e: image::ImageError| e.to_string();
+    let file = || std::fs::File::create(dest).map(std::io::BufWriter::new).map_err(|e| e.to_string());
     match import::extension(dest).as_deref() {
         Some("jpg" | "jpeg") | None => {
-            let file = std::fs::File::create(dest).map_err(|e| e.to_string())?;
-            let mut writer = std::io::BufWriter::new(file);
-            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut writer, jpeg_quality).encode_image(img).map_err(|e| e.to_string())
+            let mut writer = file()?;
+            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut writer, jpeg_quality);
+            if let Some(exif) = exif {
+                _ = encoder.set_exif_metadata(exif);
+            }
+            encoder.encode_image(img).map_err(err)
         }
-        _ => img.save(dest).map_err(|e| e.to_string()),
+        Some("png") => {
+            let mut encoder = image::codecs::png::PngEncoder::new(file()?);
+            if let Some(exif) = exif {
+                _ = encoder.set_exif_metadata(exif);
+            }
+            encoder.write_image(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::Rgb8).map_err(err)
+        }
+        _ => img.save(dest).map_err(err),
     }
 }
 

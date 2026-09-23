@@ -5,6 +5,7 @@ mod export;
 mod gpu;
 mod import;
 mod loader;
+mod metadata;
 mod preset;
 mod recommend;
 mod theme;

@@ -8,11 +8,12 @@ use crate::{app, export, import, loader, preset};
 
 const USAGE: &str = "usage:
   bp_photos [PHOTO]                                   open the app
-  bp_photos apply --preset NAME [--amount 1.0] [--crop X0,Y0,X1,Y1] [--size SIZE] [--fit] [--quality 92] IN... --out DIR
+  bp_photos apply --preset NAME [--amount 1.0] [--crop X0,Y0,X1,Y1] [--size SIZE] [--fit] [--quality 92] [--no-gps] IN... --out DIR
       --crop    crop edges as fractions 0..1 of width/height
       --size    original, instagram-portrait, instagram-square, instagram-landscape, instagram-story,
                 x-post, x-large, facebook, web, or a number (long edge in px)
       --fit     fit inside fixed formats instead of cropping to fill them
+      --no-gps  leave the photo's location out of the exported metadata
   bp_photos sheet PHOTO OUT.jpg [FILTER]              contact sheet of every preset (optionally filtered)
   bp_photos presets                                   list installed presets and any that fail to load
   bp_photos recommend PHOTO [SHEET.jpg]               presets recommended for a photo (and a sheet of them)";
@@ -64,7 +65,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
                     let img = gpu.render_image(&src, &gps[idx], 1.0, FULL_CROP, w, h)?;
                     image::imageops::overlay(&mut sheet, &img, ((i as u32 % 4) * (w + 8) + 4) as i64, ((i as u32 / 4) * (h + 8) + 4) as i64);
                 }
-                app::save_image(&sheet, Path::new(out), 90)?;
+                app::save_image(&sheet, Path::new(out), 90, None)?;
             }
             Ok(())
         }
@@ -162,6 +163,7 @@ fn apply(args: &[String]) -> Result<(), String> {
     let mut size = export::Size::Original;
     let mut fill = true;
     let mut quality = 92u8;
+    let mut keep_gps = true;
     let mut inputs = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -177,6 +179,7 @@ fn apply(args: &[String]) -> Result<(), String> {
                 };
             }
             "--fit" => fill = false,
+            "--no-gps" => keep_gps = false,
             "--quality" => quality = it.next().and_then(|v| v.parse().ok()).filter(|q| (1..=100).contains(q)).ok_or("--quality needs 1-100")?,
             "--crop" => {
                 let v: Vec<f32> = it.next().map(|v| v.split(',').filter_map(|n| n.trim().parse().ok()).collect()).unwrap_or_default();
@@ -211,7 +214,8 @@ fn apply(args: &[String]) -> Result<(), String> {
         let render_ms = start.elapsed().as_millis() - decode_ms;
         let stem = input.file_stem().unwrap_or_default().to_string_lossy();
         let dest = out_dir.join(format!("{stem}.jpg"));
-        app::save_image(&img, &dest, quality)?;
+        let exif = crate::metadata::for_export(&input, img.dimensions(), keep_gps);
+        app::save_image(&img, &dest, quality, exif)?;
         println!("{} → {}  (decode {decode_ms} ms, gpu {render_ms} ms, total {} ms)", input.display(), dest.display(), start.elapsed().as_millis());
     }
     Ok(())
@@ -242,5 +246,5 @@ fn sheet(photo: &Path, out: &Path, filter: &str) -> Result<(), String> {
     for (i, p) in presets.iter().enumerate() {
         println!("  {:>2}: row {} col {}  {}", i, i as u32 / cols, i as u32 % cols, p.name);
     }
-    app::save_image(&sheet, out, 92)
+    app::save_image(&sheet, out, 92, None)
 }

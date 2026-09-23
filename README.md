@@ -21,7 +21,8 @@ Works on macOS and Linux.
 - Before/after view, or hold the mouse on the photo to see the original.
 - Crop with aspect ratios (free, original, 1:1, 4:5, 2:3, 16:9).
 - Export at full size or for Instagram, X, Facebook or a custom size, as JPEG, PNG or TIFF.
-  Or copy to the clipboard.
+  Or copy to the clipboard. JPEG and PNG exports keep the date, camera, lens and exposure info,
+  and the location unless you untick it.
 - Picks up your Ghostty font and colour theme, if you use Ghostty.
 
 Lightroom's processing isn't public, so presets come out close to Lightroom, not identical. Masks,
