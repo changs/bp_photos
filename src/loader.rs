@@ -171,16 +171,60 @@ fn is_p3(handle: &libheif_rs::ImageHandle) -> bool {
 
 /// The camera's own JPEG preview, oriented like the photo.
 fn raw_preview(path: &Path) -> Option<DynamicImage> {
-    use rawler::decoders::RawDecodeParams;
+    raw_embedded(path, false)
+}
 
-    let source = rawler::rawsource::RawSource::new(path).ok()?;
+/// An embedded RAW image: the smallest usable one (`small`, for thumbnails) or the largest.
+/// Tried lazily, in order, since decoding each one costs time.
+fn raw_embedded(path: &Path, small: bool) -> Option<DynamicImage> {
+    use rawler::decoders::{Decoder, RawDecodeParams};
+    use rawler::rawsource::RawSource;
+
+    type Get = fn(&dyn Decoder, &RawSource, &RawDecodeParams) -> rawler::Result<Option<DynamicImage>>;
+    let source = RawSource::new(path).ok()?;
     let decoder = rawler::get_decoder(&source).ok()?;
     let params = RawDecodeParams::default();
-    let mut img = [decoder.preview_image(&source, &params), decoder.full_image(&source, &params), decoder.thumbnail_image(&source, &params)]
-        .into_iter()
-        .find_map(|r| r.ok().flatten())?;
+    let preview: Get = |d, s, p| d.preview_image(s, p);
+    let full: Get = |d, s, p| d.full_image(s, p);
+    let thumb: Get = |d, s, p| d.thumbnail_image(s, p);
+    let order = if small { [thumb, preview, full] } else { [preview, full, thumb] };
+    let mut img = order.into_iter().find_map(|get| get(decoder.as_ref(), &source, &params).ok().flatten())?;
     let exif = decoder.raw_metadata(&source, &params).ok()?.exif.orientation;
     img.apply_orientation(exif.and_then(|o| Orientation::from_exif(o as u8)).unwrap_or(Orientation::NoTransforms));
+    Some(img)
+}
+
+/// A small, upright thumbnail (longest edge about `max`) for the filmstrip, taken from the
+/// file's embedded preview when it has one, so it's much faster than a full decode.
+pub fn load_thumbnail(path: &Path, max: u32) -> Result<image::RgbaImage, String> {
+    let ext = crate::import::extension(path).unwrap_or_default();
+    let img = if RAW_EXTENSIONS.contains(&ext.as_str()) {
+        raw_embedded(path, true).map_or_else(|| load_raw(path), Ok)?
+    } else if HEIF_EXTENSIONS.contains(&ext.as_str()) {
+        heif_thumbnail(path).map(|(i, _)| i).map_or_else(|| load_heif(path).map(|(i, _)| i), Ok)?
+    } else if ext == "jpg" || ext == "jpeg" {
+        match exif_thumbnail(path) {
+            Some(img) => img,
+            None => load_jpeg(path).map_or_else(|| load_image(path), Ok)?,
+        }
+    } else {
+        load_image(path)?
+    };
+    Ok(img.thumbnail(max, max).into_rgba8())
+}
+
+/// The JPEG thumbnail stored in EXIF (usually 160×120), rotated like the photo.
+fn exif_thumbnail(path: &Path) -> Option<DynamicImage> {
+    use exif::{In, Tag};
+
+    let file = std::fs::File::open(path).ok()?;
+    let exif = exif::Reader::new().read_from_container(&mut std::io::BufReader::new(file)).ok()?;
+    let offset = exif.get_field(Tag::JPEGInterchangeFormat, In::THUMBNAIL)?.value.get_uint(0)? as usize;
+    let len = exif.get_field(Tag::JPEGInterchangeFormatLength, In::THUMBNAIL)?.value.get_uint(0)? as usize;
+    let bytes = exif.buf().get(offset..offset + len)?;
+    let mut img = image::load_from_memory_with_format(bytes, image::ImageFormat::Jpeg).ok()?;
+    let orientation = exif.get_field(Tag::Orientation, In::PRIMARY).and_then(|f| f.value.get_uint(0));
+    img.apply_orientation(orientation.and_then(|o| Orientation::from_exif(o as u8)).unwrap_or(Orientation::NoTransforms));
     Some(img)
 }
 

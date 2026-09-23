@@ -149,6 +149,10 @@ pub struct PhotoApp {
     browser: crate::browse::Browser,
     /// The photo most recently asked for (it may still be loading).
     target: Option<PathBuf>,
+    filmstrip: crate::filmstrip::Filmstrip,
+    show_filmstrip: bool,
+    /// The photo the filmstrip last scrolled to, so it follows the current photo.
+    filmstrip_at: Option<PathBuf>,
     /// Presets recommended for the current photo, best first.
     recs: Vec<crate::recommend::Rec>,
     /// Recommendations need recomputing (new photo, crop or presets).
@@ -226,6 +230,9 @@ impl PhotoApp {
             zoom_dirty: false,
             browser: crate::browse::Browser::new(),
             target: None,
+            filmstrip: crate::filmstrip::Filmstrip::new(),
+            show_filmstrip: cc.egui_ctx.data_mut(|d| d.get_persisted(egui::Id::new("show_filmstrip")).unwrap_or(false)),
+            filmstrip_at: None,
             nav_cells: Vec::new(),
             screenshot: std::env::var_os("BP_PHOTOS_SCREENSHOT").map(|p| (PathBuf::from(p), 0)),
             selected_section: String::new(),
@@ -431,7 +438,16 @@ impl PhotoApp {
     /// immediately; one still preloading is picked up when it's ready.
     fn navigate(&mut self, delta: isize, ctx: &egui::Context) {
         let Some(current) = self.target.clone() else { return };
-        let Some(next) = self.browser.neighbour(&current, delta) else { return };
+        if let Some(next) = self.browser.neighbour(&current, delta) {
+            self.goto(next, ctx);
+        }
+    }
+
+    /// Shows another photo from the current folder, using its preload if there is one.
+    fn goto(&mut self, next: PathBuf, ctx: &egui::Context) {
+        if self.target.as_ref() == Some(&next) {
+            return;
+        }
         self.target = Some(next.clone());
         self.loading = None;
         self.browser.pending = None;
@@ -442,6 +458,71 @@ impl PhotoApp {
             self.browser.pending = Some(next);
         } else {
             self.open(next, ctx);
+        }
+    }
+
+    fn set_filmstrip(&mut self, ctx: &egui::Context, show: bool) {
+        self.show_filmstrip = show;
+        self.filmstrip_at = None; // scroll to the current photo when it appears
+        ctx.data_mut(|d| d.insert_persisted(egui::Id::new("show_filmstrip"), show));
+    }
+
+    /// The folder's photos as thumbnails; the current one highlighted, click to open.
+    fn filmstrip_panel(&mut self, ui: &mut egui::Ui) {
+        let files = self.browser.files.clone();
+        let current = self.target.as_ref().and_then(|t| self.browser.position(t));
+        self.filmstrip.update(ui.ctx(), &files, current);
+        if files.is_empty() {
+            ui.label(egui::RichText::new("Open a photo to see the rest of its folder here.").weak());
+            return;
+        }
+        let follow = self.target != self.filmstrip_at;
+        self.filmstrip_at = self.target.clone();
+        let (cell, label_h) = (Vec2::new(116.0, 92.0), 16.0);
+        let mut clicked = None;
+        egui::ScrollArea::horizontal().auto_shrink([false, true]).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                for (i, path) in files.iter().enumerate() {
+                    let (rect, response) = ui.allocate_exact_size(cell, Sense::click());
+                    let is_current = current == Some(i);
+                    if is_current && follow {
+                        response.scroll_to_me(Some(egui::Align::Center));
+                    }
+                    if !ui.is_rect_visible(rect) {
+                        continue;
+                    }
+                    let painter = ui.painter_at(rect.expand(2.0));
+                    let img_rect = Rect::from_min_size(rect.min, Vec2::new(cell.x, cell.y - label_h));
+                    painter.rect_filled(img_rect, 4.0, ui.visuals().extreme_bg_color);
+                    if let Some((texture, [w, h])) = self.filmstrip.get(path) {
+                        let r = fit_rect(img_rect.shrink(2.0), (w as u32, h as u32));
+                        painter.image(texture.id(), r, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                    } else {
+                        let text = if self.filmstrip.failed(path) { "?" } else { "…" };
+                        painter.text(img_rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(14.0), ui.visuals().weak_text_color());
+                    }
+                    let stroke = if is_current {
+                        Stroke::new(2.0, ui.visuals().selection.bg_fill)
+                    } else if response.hovered() {
+                        Stroke::new(1.0, ui.visuals().widgets.hovered.fg_stroke.color)
+                    } else {
+                        Stroke::NONE
+                    };
+                    painter.rect_stroke(img_rect, 4.0, stroke, egui::StrokeKind::Outside);
+                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let color = if is_current { ui.visuals().strong_text_color() } else { ui.visuals().weak_text_color() };
+                    let galley = painter.layout(name.clone(), egui::FontId::proportional(10.5), color, cell.x);
+                    let pos = egui::pos2(rect.center().x - galley.size().x.min(cell.x) / 2.0, img_rect.max.y + 2.0);
+                    painter.with_clip_rect(rect).galley(pos, galley, Color32::WHITE);
+                    if response.on_hover_text(name).clicked() {
+                        clicked = Some(path.clone());
+                    }
+                }
+            });
+        });
+        if let Some(path) = clicked {
+            self.goto(path, &ui.ctx().clone());
         }
     }
 
@@ -1066,6 +1147,9 @@ impl PhotoApp {
         if ctx.input(|i| plain_key(i, Key::C)) {
             self.start_crop();
         }
+        if ctx.input(|i| plain_key(i, Key::F)) {
+            self.set_filmstrip(ctx, !self.show_filmstrip);
+        }
         if ctx.input(|i| plain_key(i, Key::Z)) {
             self.toggle_zoom(None);
         }
@@ -1168,6 +1252,10 @@ impl PhotoApp {
             ui.add_enabled_ui(self.cropping.is_none(), |ui| {
                 ui.toggle_value(&mut self.side_by_side, "◫ Before / After").on_hover_text("Show the original next to the edit (Y)");
             });
+            if ui.add(egui::Button::selectable(self.show_filmstrip, "🎞 Filmstrip")).on_hover_text("Show the folder's photos along the bottom (F)").clicked() {
+                let show = !self.show_filmstrip;
+                self.set_filmstrip(ui.ctx(), show);
+            }
             let zoomed = self.zoom.is_some();
             if ui.add_enabled(self.zoom_available(), egui::Button::selectable(zoomed, "🔍 100%")).on_hover_text("Zoom to 100% (Z, or double-click the photo)").clicked() {
                 self.toggle_zoom(None);
@@ -1222,7 +1310,12 @@ impl PhotoApp {
         }
         let mut clicked = None;
         self.nav_cells.clear();
-        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+        let mut scroll = egui::ScrollArea::vertical().auto_shrink(false);
+        // Screenshot mode starts at the top, whatever scroll position was saved last session.
+        if self.screenshot.as_ref().is_some_and(|(_, frames)| *frames <= 1) {
+            scroll = scroll.vertical_scroll_offset(0.0);
+        }
+        scroll.show(ui, |ui| {
             for (title, id, items, open, recommended) in &sections {
                 egui::CollapsingHeader::new(format!("{title}  ({})", items.len()))
                     .id_salt(id)
@@ -1450,6 +1543,8 @@ impl PhotoApp {
         // Full image loaded and its recommendations settled (not the quick preview's).
         let settled = !self.recs_dirty && self.recs_job.is_none() && self.recs_rx.is_none();
         let ready = self.photo.as_ref().is_some_and(|p| !p.provisional) && !self.recs.is_empty() && settled;
+        // Wait for filmstrip thumbnails too, once it's shown (from frame 1).
+        let ready = ready && !(*frames > 0 && self.show_filmstrip && self.filmstrip.loading());
         let frames = if ready { frames + 1 } else { *frames };
         if let Some((_, f)) = &mut self.screenshot {
             *f = frames;
@@ -1460,6 +1555,7 @@ impl PhotoApp {
                 self.selected = self.recs[0].index;
                 self.preview_dirty = true;
                 self.side_by_side = std::env::var_os("BP_PHOTOS_SCREENSHOT_COMPARE").is_some();
+                self.show_filmstrip = std::env::var_os("BP_PHOTOS_SCREENSHOT_FILMSTRIP").is_some();
                 if std::env::var_os("BP_PHOTOS_SCREENSHOT_ZOOM").is_some() {
                     self.toggle_zoom(Some([0.62, 0.45]));
                     if let (Some(z), Some(s)) = (&mut self.zoom, std::env::var("BP_PHOTOS_SCREENSHOT_ZOOM").ok().and_then(|v| v.parse::<f32>().ok())) {
@@ -1519,6 +1615,13 @@ impl eframe::App for PhotoApp {
             });
         }
         egui::Panel::bottom("status").show(ui, |ui| ui.label(egui::RichText::new(&self.status).small()));
+        if self.show_filmstrip {
+            egui::Panel::bottom("filmstrip").resizable(false).show(ui, |ui| {
+                ui.add_space(4.0);
+                self.filmstrip_panel(ui);
+                ui.add_space(2.0);
+            });
+        }
         egui::Panel::right("presets").resizable(true).default_size(330.0).size_range(200.0..=1200.0).show(ui, |ui| self.preset_panel(ui, &visible));
         egui::CentralPanel::default().show(ui, |ui| self.preview(ui));
         if self.export_dialog {

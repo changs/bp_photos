@@ -3,6 +3,7 @@ mod browse;
 mod cli;
 mod crop;
 mod export;
+mod filmstrip;
 mod gpu;
 mod import;
 mod loader;

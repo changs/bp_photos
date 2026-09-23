@@ -6,7 +6,9 @@ pick one, export. It's the preset browser from Lightroom and nothing else.
 Rust + egui + wgpu. Everything runs on the GPU, so the preview and all thumbnails update instantly.
 Works on macOS and Linux.
 
-![bp_photos showing a before/after comparison and recommended presets](docs/screenshot.jpg)
+![bp_photos with a photo and the presets recommended for it](docs/screenshot.jpg)
+
+![Before/after comparison with the folder's filmstrip below](docs/screenshot-compare.jpg)
 
 ## Features
 
@@ -21,6 +23,7 @@ Works on macOS and Linux.
 - Before/after view, or hold the mouse on the photo to see the original. Zoom to 100% to check
   grain and sharpness.
 - Step through the photos in a folder; the next and previous ones are decoded in the background.
+  An optional filmstrip shows the whole folder, using the thumbnails already embedded in the files.
 - Crop with aspect ratios (free, original, 1:1, 4:5, 2:3, 16:9).
 - Export at full size or for Instagram, X, Facebook or a custom size, as JPEG, PNG or TIFF.
   Or copy to the clipboard. JPEG and PNG exports keep the date, camera, lens and exposure info,
@@ -47,6 +50,7 @@ cargo run --release -- photo.jpg
 |---|---|
 | arrows | move through presets |
 | `[` / `]` | previous / next photo in the folder (preloaded, so it's instant) |
+| `F` | filmstrip |
 | `Z` or double-click | 100% view, drag to pan (both sides in before/after) |
 | pinch, or `⌘`/`Ctrl` + scroll | zoom from fit to 800% around the pointer |
 | scroll | change amount |
