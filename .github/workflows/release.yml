@@ -1,0 +1,41 @@
+# Builds the macOS app and attaches the .dmg to a GitHub release when a version tag is pushed
+# (git tag v0.1.0 && git push origin v0.1.0). Run it by hand to just get the .dmg as an artifact.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build tools
+        run: brew install cmake meson ninja pkgconf
+
+      - name: Cache libheif and decoders
+        uses: actions/cache@v4
+        with:
+          path: target/macos/deps-*
+          key: heif-deps-${{ runner.os }}-${{ hashFiles('scripts/bundle-macos.sh') }}
+
+      - name: Build app
+        run: ./scripts/bundle-macos.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bp_photos-macos
+          path: dist/*.dmg
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.dmg --title "$GITHUB_REF_NAME" --generate-notes

@@ -33,6 +33,15 @@ Works on macOS and Linux.
 Lightroom's processing isn't public, so presets come out close to Lightroom, not identical. Masks,
 profiles, sharpening, noise reduction and lens corrections are ignored.
 
+## Download
+
+macOS 12 or later, Apple silicon: grab the `.dmg` from
+[Releases](https://github.com/changs/bp_photos/releases) and drag the app to Applications.
+
+The app isn't notarised by Apple, so the first time macOS will refuse to open it. Open it once
+from System Settings → Privacy & Security → *Open Anyway*, or run
+`xattr -dr com.apple.quarantine "/Applications/BP Photos.app"`.
+
 ## Build
 
 ```sh
@@ -43,6 +52,9 @@ cargo run --release -- photo.jpg
 ```
 
 `rust-toolchain.toml` pins the Rust version; rustup installs it on first build.
+
+`scripts/bundle-macos.sh` makes `dist/BP Photos.app` and a `.dmg` (needs `brew install cmake meson ninja`).
+It builds libheif with only its decoders, so no GPL encoder code ends up in the app.
 
 ## Keys
 
