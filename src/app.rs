@@ -67,6 +67,16 @@ struct ExportSettings {
 
 const FORMATS: [(&str, &str); 3] = [("JPEG", "jpg"), ("PNG", "png"), ("TIFF", "tif")];
 
+/// Zoomed-in view: the photo point (normalised) at the centre, and screen pixels per photo pixel.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Zoom {
+    center: [f32; 2],
+    scale: f32,
+}
+
+/// Deepest pinch zoom, in screen pixels per photo pixel.
+const MAX_ZOOM: f32 = 8.0;
+
 /// Render targets for the 100% view: the visible region of the photo, edited and original.
 struct ZoomViews {
     size: (u32, u32),
@@ -129,8 +139,8 @@ pub struct PhotoApp {
     /// Section the selection was made in (a preset can appear in "Recommended" and its group).
     selected_section: String,
     egui_ctx: egui::Context,
-    /// 100% view: the point of the photo (normalised coordinates) at the centre of the view.
-    zoom: Option<[f32; 2]>,
+    /// Zoomed view (100% via Z/double-click, any level via pinch); `None` = fit to window.
+    zoom: Option<Zoom>,
     /// Drag-to-pan: pointer position and zoom centre when the drag began.
     zoom_drag: Option<(egui::Pos2, [f32; 2])>,
     zoom_views: Option<ZoomViews>,
@@ -285,26 +295,74 @@ impl PhotoApp {
             && let Some(photo) = &self.photo
         {
             let c = photo.crop;
-            self.zoom = Some(at.unwrap_or([(c[0] + c[2]) / 2.0, (c[1] + c[3]) / 2.0]));
+            let center = at.unwrap_or([(c[0] + c[2]) / 2.0, (c[1] + c[3]) / 2.0]);
+            self.zoom = Some(Zoom { center, scale: 1.0 });
         }
     }
 
-    /// The 100% view: one photo pixel per screen pixel, dragged to pan.
-    fn zoom_view(&mut self, ui: &mut egui::Ui, rect: Rect, response: &egui::Response) -> Rect {
-        let photo = self.photo.as_ref().unwrap();
-        let (size, crop) = (photo.size(), photo.crop);
-        let ppp = ui.ctx().pixels_per_point();
+    /// Where zoomed views go: the whole area, or two side-by-side halves for before/after.
+    fn zoom_cells(&self, rect: Rect) -> Vec<Rect> {
         let area = rect.shrink(12.0);
-        let cells = if self.side_by_side {
+        if self.side_by_side {
             let w = (area.width() - 12.0) / 2.0;
             let left = Rect::from_min_size(area.min, Vec2::new(w, area.height()));
             vec![left, left.translate(Vec2::new(w + 12.0, 0.0))]
         } else {
             vec![area]
+        }
+    }
+
+    /// Screen pixels per photo pixel at which the (cropped) photo just fits a zoom cell.
+    fn fit_scale(&self, cell: Rect, ppp: f32) -> f32 {
+        let photo = self.photo.as_ref().unwrap();
+        let (w, h) = crop::pixel_size(photo.crop, photo.size());
+        (cell.width() * ppp / w as f32).min(cell.height() * ppp / h as f32)
+    }
+
+    /// Pinch (or ⌘/Ctrl + scroll) over the photo: zooms about the pointer, from fit up to 800%.
+    /// `fitted` are the on-screen photo rects (and crops they show) when not zoomed.
+    fn handle_pinch(&mut self, ui: &egui::Ui, rect: Rect, response: &egui::Response, fitted: &[(Rect, Crop)]) {
+        let pinch = ui.input(|i| i.zoom_delta());
+        let Some(cursor) = response.hover_pos() else { return };
+        if (pinch - 1.0).abs() < 1e-4 || !self.zoom_available() {
+            return;
+        }
+        let ppp = ui.ctx().pixels_per_point();
+        let size = self.photo.as_ref().unwrap().size();
+        let cells = self.zoom_cells(rect);
+        let cell = cells.iter().copied().find(|c| c.contains(cursor)).unwrap_or(*cells.last().unwrap());
+        let fit = self.fit_scale(cell, ppp);
+        let current = self.zoom.map_or(fit, |z| z.scale);
+        let scale = (current * pinch).min(MAX_ZOOM);
+        if scale <= fit {
+            if self.zoom.is_some() {
+                self.toggle_zoom(None);
+            }
+            return;
+        }
+        // The photo point under the pointer stays under it.
+        let offset = (cursor - cell.center()) * ppp;
+        let under = match self.zoom {
+            Some(z) => [z.center[0] + offset.x / z.scale / size.0 as f32, z.center[1] + offset.y / z.scale / size.1 as f32],
+            None => {
+                let Some((r, c)) = fitted.iter().find(|(r, _)| r.contains(cursor)) else { return };
+                let u = (cursor - r.min) / r.size();
+                [c[0] + u.x * (c[2] - c[0]), c[1] + u.y * (c[3] - c[1])]
+            }
         };
+        let center = [under[0] - offset.x / scale / size.0 as f32, under[1] - offset.y / scale / size.1 as f32];
+        self.zoom = Some(Zoom { center, scale });
+    }
+
+    /// The zoomed view (1:1 at 100%), dragged to pan.
+    fn zoom_view(&mut self, ui: &mut egui::Ui, rect: Rect, response: &egui::Response) -> Rect {
+        let photo = self.photo.as_ref().unwrap();
+        let (size, crop) = (photo.size(), photo.crop);
+        let ppp = ui.ctx().pixels_per_point();
+        let cells = self.zoom_cells(rect);
 
         // Pan: dragging moves the photo with the pointer.
-        let mut center = self.zoom.unwrap();
+        let Zoom { mut center, scale } = self.zoom.unwrap();
         if response.drag_started()
             && let Some(p) = ui.input(|i| i.pointer.press_origin())
         {
@@ -312,7 +370,7 @@ impl PhotoApp {
         }
         if let Some((origin, start)) = self.zoom_drag {
             if let Some(p) = response.interact_pointer_pos() {
-                let d = (p - origin) * ppp;
+                let d = (p - origin) * ppp / scale;
                 center = [start[0] - d.x / size.0 as f32, start[1] - d.y / size.1 as f32];
             }
             if !response.dragged() {
@@ -320,9 +378,13 @@ impl PhotoApp {
             }
         }
         let cell_px = (cells[0].width() * ppp, cells[0].height() * ppp);
-        let (region, center) = zoom_region(center, cell_px, size, crop);
-        self.zoom = Some(center);
-        let px = crop::pixel_size(region, size);
+        let (region, center) = zoom_region(center, cell_px, size, crop, scale);
+        self.zoom = Some(Zoom { center, scale });
+        // Target pixels = screen pixels, so 100% is exactly one photo pixel per screen pixel.
+        let px = (
+            (((region[2] - region[0]) * size.0 as f32 * scale).round() as u32).max(1),
+            (((region[3] - region[1]) * size.1 as f32 * scale).round() as u32).max(1),
+        );
 
         if self.zoom_views.as_ref().is_none_or(|z| z.size != px) {
             let (edited, original) = (self.new_view(px), self.new_view(px));
@@ -350,12 +412,16 @@ impl PhotoApp {
         let after = shown(*cells.last().unwrap());
         painter.image(z.edited.1, after, uv, Color32::WHITE);
         if self.side_by_side {
-            let before = shown(cells[0]);
-            painter.image(z.original.1, before, uv, Color32::WHITE);
-            badge(&painter, before, "Before · 100%");
-            badge(&painter, after, &format!("{name} · 100%"));
+            painter.image(z.original.1, shown(cells[0]), uv, Color32::WHITE);
+        }
+        let pct = format!("{:.0}%", scale * 100.0);
+        if self.side_by_side {
+            badge(&painter, shown(cells[0]), &format!("Before · {pct}"));
+            badge(&painter, after, &format!("{name} · {pct}"));
+        } else if self.show_original {
+            badge(&painter, after, &format!("Original · {pct}"));
         } else {
-            badge(&painter, after, if self.show_original { "Original · 100%" } else { "100%" });
+            badge(&painter, after, &pct);
         }
         ui.ctx().set_cursor_icon(if self.zoom_drag.is_some() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
         after
@@ -1277,8 +1343,8 @@ impl PhotoApp {
         let zoomed = self.zoom.is_some() && self.zoom_available();
         let painter = ui.painter_at(rect);
         let mut edited_rect = None;
-        // Where on screen the (fitted) photo is, for double-click-to-zoom: (rect, crop shown).
-        let mut fitted: Option<(Rect, Crop)> = None;
+        // Where on screen the (fitted) photo is, for zooming into a spot: (rect, crop shown).
+        let mut fitted: Vec<(Rect, Crop)> = Vec::new();
         match &self.photo {
             Some(_) if zoomed => {
                 edited_rect = Some(self.zoom_view(ui, rect, &response));
@@ -1293,7 +1359,7 @@ impl PhotoApp {
                 badge(&painter, b, "Before");
                 badge(&painter, a, &self.presets[self.selected].name);
                 edited_rect = Some(a);
-                fitted = Some((a, photo.view_crop));
+                fitted = vec![(b, photo.view_crop), (a, photo.view_crop)];
             }
             Some(photo) => {
                 let r = fit_rect(rect.shrink(12.0), (photo.preview.width, photo.preview.height));
@@ -1302,7 +1368,7 @@ impl PhotoApp {
                     badge(&painter, r, "Original");
                 }
                 edited_rect = Some(r);
-                fitted = Some((r, photo.view_crop));
+                fitted = vec![(r, photo.view_crop)];
             }
             None => {
                 let text = if self.loading.is_some() { "Loading…" } else { "Drop a photo here, or click Open.\nDrop .xmp / .lrtemplate / .cube files to import presets." };
@@ -1329,11 +1395,13 @@ impl PhotoApp {
             }
         }
 
+        self.handle_pinch(ui, rect, &response, &fitted);
         // Double-click zooms to 100% at that spot, or back out.
         if response.double_clicked() && self.photo.is_some() {
-            let at = fitted.zip(response.interact_pointer_pos()).filter(|((r, _), p)| r.contains(*p)).map(|((r, c), p)| {
+            let at = response.interact_pointer_pos().and_then(|p| {
+                let (r, c) = fitted.iter().find(|(r, _)| r.contains(p))?;
                 let u = (p - r.min) / r.size();
-                [c[0] + u.x * (c[2] - c[0]), c[1] + u.y * (c[3] - c[1])]
+                Some([c[0] + u.x * (c[2] - c[0]), c[1] + u.y * (c[3] - c[1])])
             });
             self.toggle_zoom(at);
         }
@@ -1346,9 +1414,9 @@ impl PhotoApp {
         }
         if self.amount_changed_at.is_none() {
             let tip = if zoomed {
-                "Drag to pan · double-click or Z for the whole photo · hold \\ to see the original"
+                "Drag to pan · pinch to zoom · double-click or Z for the whole photo · hold \\ to see the original"
             } else {
-                "Scroll to change the amount · hold the mouse button (or \\) to see the original · double-click or Z for 100%"
+                "Scroll to change the amount · hold the mouse button (or \\) to see the original · pinch, double-click or Z to zoom"
             };
             response.on_hover_text(tip);
         }
@@ -1394,6 +1462,9 @@ impl PhotoApp {
                 self.side_by_side = std::env::var_os("BP_PHOTOS_SCREENSHOT_COMPARE").is_some();
                 if std::env::var_os("BP_PHOTOS_SCREENSHOT_ZOOM").is_some() {
                     self.toggle_zoom(Some([0.62, 0.45]));
+                    if let (Some(z), Some(s)) = (&mut self.zoom, std::env::var("BP_PHOTOS_SCREENSHOT_ZOOM").ok().and_then(|v| v.parse::<f32>().ok())) {
+                        z.scale = s;
+                    }
                 }
             }
             // A few frames for thumbnails to render, then capture.
@@ -1465,11 +1536,12 @@ fn plain_key(i: &egui::InputState, key: Key) -> bool {
     i.key_pressed(key) && !i.modifiers.command && !i.modifiers.ctrl && !i.modifiers.alt
 }
 
-/// The region of the photo shown at 100% in a view of `view_px` screen pixels, centred as close
-/// to `center` as the crop allows. Returns the region and the (clamped) centre.
-fn zoom_region(center: [f32; 2], view_px: (f32, f32), image: (u32, u32), within: Crop) -> (Crop, [f32; 2]) {
-    let rw = (view_px.0 / image.0 as f32).min(within[2] - within[0]);
-    let rh = (view_px.1 / image.1 as f32).min(within[3] - within[1]);
+/// The region of the photo shown in a view of `view_px` screen pixels at `scale` screen pixels
+/// per photo pixel, centred as close to `center` as the crop allows. Returns it and the
+/// (clamped) centre.
+fn zoom_region(center: [f32; 2], view_px: (f32, f32), image: (u32, u32), within: Crop, scale: f32) -> (Crop, [f32; 2]) {
+    let rw = (view_px.0 / scale / image.0 as f32).min(within[2] - within[0]);
+    let rh = (view_px.1 / scale / image.1 as f32).min(within[3] - within[1]);
     // Not `clamp`: when the view spans the whole crop, rounding can put min a hair above max.
     let fit = |v: f32, lo: f32, hi: f32| if lo >= hi { (lo + hi) / 2.0 } else { v.max(lo).min(hi) };
     let cx = fit(center[0], within[0] + rw / 2.0, within[2] - rw / 2.0);
@@ -1605,15 +1677,18 @@ mod tests {
     #[test]
     fn zoom_region_is_one_to_one_and_stays_inside_the_crop() {
         // 1000×500 view on a 4000×2000 photo: a quarter of each side, one pixel per pixel.
-        let (r, c) = zoom_region([0.5, 0.5], (1000.0, 500.0), (4000, 2000), FULL_CROP);
+        let (r, c) = zoom_region([0.5, 0.5], (1000.0, 500.0), (4000, 2000), FULL_CROP, 1.0);
         assert_eq!(r, [0.375, 0.375, 0.625, 0.625]);
         assert_eq!(c, [0.5, 0.5]);
         // Panned past the corner: clamped so the view stays on the photo.
-        let (r, _) = zoom_region([0.0, 1.0], (1000.0, 500.0), (4000, 2000), FULL_CROP);
+        let (r, _) = zoom_region([0.0, 1.0], (1000.0, 500.0), (4000, 2000), FULL_CROP, 1.0);
         assert_eq!(r, [0.0, 0.75, 0.25, 1.0]);
         // View bigger than a small crop: shows the whole crop.
-        let (r, _) = zoom_region([0.5, 0.5], (4000.0, 4000.0), (4000, 2000), [0.2, 0.2, 0.4, 0.6]);
+        let (r, _) = zoom_region([0.5, 0.5], (4000.0, 4000.0), (4000, 2000), [0.2, 0.2, 0.4, 0.6], 1.0);
         assert!(r.iter().zip([0.2, 0.2, 0.4, 0.6]).all(|(a, b)| (a - b).abs() < 1e-6), "{r:?}");
+        // At 200% the same view shows half as much of the photo.
+        let (r, _) = zoom_region([0.5, 0.5], (1000.0, 500.0), (4000, 2000), FULL_CROP, 2.0);
+        assert_eq!(r, [0.4375, 0.4375, 0.5625, 0.5625]);
     }
 
     #[test]

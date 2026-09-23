@@ -48,6 +48,7 @@ cargo run --release -- photo.jpg
 | arrows | move through presets |
 | `[` / `]` | previous / next photo in the folder (preloaded, so it's instant) |
 | `Z` or double-click | 100% view, drag to pan (both sides in before/after) |
+| pinch, or `⌘`/`Ctrl` + scroll | zoom from fit to 800% around the pointer |
 | scroll | change amount |
 | `\` (hold) | show original |
 | `Y` | before / after |
