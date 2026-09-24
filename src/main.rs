@@ -57,7 +57,9 @@ fn main() -> eframe::Result {
             .with_title("BP Photos")
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([800.0, 500.0])
-            .with_drag_and_drop(true),
+            .with_drag_and_drop(true)
+            // Dock/taskbar icon when not running from the .app bundle (e.g. `cargo run`).
+            .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).unwrap_or_default()),
         ..Default::default()
     };
     eframe::run_native("BP Photos", options, Box::new(|cc| Ok(Box::new(app::PhotoApp::new(cc, initial)))))

@@ -1,4 +1,8 @@
-# bp_photos
+<p align="center">
+  <img src="assets/icon.png" width="128" alt="">
+</p>
+
+<h1 align="center">bp_photos</h1>
 
 A small desktop app for trying presets on photos. Open a photo, see every preset applied to it,
 pick one, export. It's the preset browser from Lightroom and nothing else.
