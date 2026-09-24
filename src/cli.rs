@@ -14,6 +14,7 @@ const USAGE: &str = "usage:
                 x-post, x-large, facebook, web, or a number (long edge in px)
       --fit     fit inside fixed formats instead of cropping to fill them
       --no-gps  leave the photo's location out of the exported metadata
+      --edited  save next to each original as NAME-edited.EXT, same format where possible (no --out)
   bp_photos sheet PHOTO OUT.jpg [FILTER]              contact sheet of every preset (optionally filtered)
   bp_photos presets                                   list installed presets and any that fail to load
   bp_photos recommend PHOTO [SHEET.jpg]               presets recommended for a photo (and a sheet of them)";
@@ -164,6 +165,7 @@ fn apply(args: &[String]) -> Result<(), String> {
     let mut fill = true;
     let mut quality = 92u8;
     let mut keep_gps = true;
+    let mut edited = false;
     let mut inputs = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -180,6 +182,7 @@ fn apply(args: &[String]) -> Result<(), String> {
             }
             "--fit" => fill = false,
             "--no-gps" => keep_gps = false,
+            "--edited" => edited = true,
             "--quality" => quality = it.next().and_then(|v| v.parse().ok()).filter(|q| (1..=100).contains(q)).ok_or("--quality needs 1-100")?,
             "--crop" => {
                 let v: Vec<f32> = it.next().map(|v| v.split(',').filter_map(|n| n.trim().parse().ok()).collect()).unwrap_or_default();
@@ -192,7 +195,12 @@ fn apply(args: &[String]) -> Result<(), String> {
             _ => inputs.push(PathBuf::from(a)),
         }
     }
-    let (Some(name), Some(out_dir)) = (name, out_dir) else { return Err(USAGE.into()) };
+    let Some(name) = name else { return Err(USAGE.into()) };
+    let out_dir = match (out_dir, edited) {
+        (Some(dir), false) => Some(dir),
+        (None, true) => None,
+        _ => return Err(USAGE.into()),
+    };
     let preset = match Path::new(&name) {
         p if import::is_preset_file(p) && p.exists() => import::load_file(p, "CLI")?,
         _ => all_presets()
@@ -200,7 +208,9 @@ fn apply(args: &[String]) -> Result<(), String> {
             .find(|p| p.name.eq_ignore_ascii_case(&name))
             .ok_or_else(|| format!("no preset named {name:?}"))?,
     };
-    std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+    if let Some(dir) = &out_dir {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
     let gpu = headless_gpu()?;
     let gp = gpu.create_preset(&preset);
     for input in inputs {
@@ -212,8 +222,10 @@ fn apply(args: &[String]) -> Result<(), String> {
         let img = gpu.render_image(&src, &gp, amount, plan.crop, plan.render.0, plan.render.1)?;
         let img = app::resize(img, plan.output);
         let render_ms = start.elapsed().as_millis() - decode_ms;
-        let stem = input.file_stem().unwrap_or_default().to_string_lossy();
-        let dest = out_dir.join(format!("{stem}.jpg"));
+        let dest = match &out_dir {
+            Some(dir) => dir.join(format!("{}.jpg", input.file_stem().unwrap_or_default().to_string_lossy())),
+            None => export::edited_path(&input).0,
+        };
         let exif = crate::metadata::for_export(&input, img.dimensions(), keep_gps);
         app::save_image(&img, &dest, quality, exif)?;
         println!("{} → {}  (decode {decode_ms} ms, gpu {render_ms} ms, total {} ms)", input.display(), dest.display(), start.elapsed().as_millis());

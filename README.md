@@ -78,12 +78,14 @@ It builds libheif with only its decoders, so no GPL encoder code ends up in the 
 | `Y` | before / after |
 | `C` | crop (`X` rotates the ratio, `Enter` applies, `Esc` cancels) |
 | `⌘E` / `Ctrl+E` | export |
+| `⌘S` / `Ctrl+S` | quick export: full size, next to the original as `name-edited.ext`, same format (HEIC/RAW → JPEG) |
 | `⌘C` / `Ctrl+C` | copy to clipboard |
 
 ## Command line
 
 ```sh
 bp_photos apply --preset "Portra-ish" --size instagram-portrait *.heic --out insta/
+bp_photos apply --preset "Portra-ish" --edited *.jpg   # save each as name-edited.jpg next to it
 bp_photos recommend photo.jpg        # suggested presets and why
 bp_photos presets                    # list installed presets
 bp_photos bench photo.heic           # time each loading step

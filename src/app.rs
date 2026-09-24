@@ -111,6 +111,8 @@ pub struct PhotoApp {
     photo: Option<Photo>,
     loading: Option<Receiver<LoadResult>>,
     exporting: Option<Receiver<Result<PathBuf, String>>>,
+    /// Extra detail for the "Exported …" status (e.g. a format change on Quick Export).
+    export_note: Option<String>,
     /// Resized RGBA image on its way to the clipboard.
     copying: Option<Receiver<(u32, u32, Vec<u8>)>>,
     /// Kept for the app's lifetime: on Linux, clipboard contents live only as long as their owner.
@@ -204,6 +206,7 @@ impl PhotoApp {
             photo: None,
             loading: None,
             exporting: None,
+            export_note: None,
             copying: None,
             clipboard: None,
             status: match &look {
@@ -484,6 +487,7 @@ impl PhotoApp {
                     None => self.status = format!("No photos in {}", dir.display()),
                 }
             }
+            Command::QuickExport => self.quick_export(),
             // Same as ⌘C: the edited photo at the export dialog's size and crop.
             Command::CopyToClipboard => {
                 if !self.photo.as_ref().is_some_and(|p| !p.provisional) {
@@ -502,12 +506,13 @@ impl PhotoApp {
         use crate::palette::Command;
         use egui::{KeyboardShortcut, Modifiers};
         let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
-        let (palette, palette_k, open_folder, open_file) = ctx.input_mut(|i| {
+        let (palette, palette_k, open_folder, open_file, quick_export) = ctx.input_mut(|i| {
             (
                 i.consume_shortcut(&KeyboardShortcut::new(cmd_shift, Key::P)),
                 i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::K)),
                 i.consume_shortcut(&KeyboardShortcut::new(cmd_shift, Key::O)),
                 i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::O)),
+                i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::S)),
             )
         });
         if palette || palette_k {
@@ -516,6 +521,8 @@ impl PhotoApp {
             self.run_command(Command::OpenFolder, ctx);
         } else if open_file {
             self.run_command(Command::OpenFile, ctx);
+        } else if quick_export && self.cropping.is_none() {
+            self.run_command(Command::QuickExport, ctx);
         }
     }
 
@@ -1090,6 +1097,29 @@ impl PhotoApp {
         else {
             return;
         };
+        self.write_export(plan, dest);
+    }
+
+    /// Quick Export (⌘S): full size, next to the original as `name-edited.ext`, same format
+    /// where we can write it (HEIC, AVIF and RAW become JPEG). No dialog.
+    fn quick_export(&mut self) {
+        let Some(photo) = self.photo.as_ref().filter(|p| !p.provisional) else {
+            self.status = "Open a photo first (or wait for it to finish loading).".into();
+            return;
+        };
+        if self.exporting.is_some() {
+            return;
+        }
+        let plan = export::plan(export::Size::Original, photo.crop, photo.size(), false);
+        let (dest, converted) = export::edited_path(&photo.path);
+        self.export_note = converted.map(|from| format!(" (as JPEG: {from} can't be written)"));
+        self.write_export(plan, dest);
+    }
+
+    /// Renders `plan` and saves it to `dest` in the background, with the photo's metadata.
+    fn write_export(&mut self, plan: export::Plan, dest: PathBuf) {
+        let Some(photo) = &self.photo else { return };
+        let st = &self.export_settings;
         let start = Instant::now();
         let (w, h) = plan.render;
         let quality = st.quality;
@@ -1152,8 +1182,9 @@ impl PhotoApp {
         if let Some(rx) = &self.exporting {
             if let Ok(result) = rx.try_recv() {
                 self.exporting = None;
+                let note = self.export_note.take().unwrap_or_default();
                 self.status = match result {
-                    Ok(p) => format!("Exported {}", p.display()),
+                    Ok(p) => format!("Exported {}{note}", p.display()),
                     Err(e) => format!("Export failed: {e}"),
                 };
             } else {

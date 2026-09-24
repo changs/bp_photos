@@ -1,5 +1,7 @@
 //! Export sizes for common destinations, and how a crop maps onto them.
 
+use std::path::{Path, PathBuf};
+
 use crate::crop;
 use crate::gpu::Crop;
 
@@ -79,6 +81,28 @@ pub fn plan(size: Size, crop: Crop, image: (u32, u32), fill: bool) -> Plan {
     }
 }
 
+/// Formats we can write, by extension.
+const WRITABLE: [&str; 6] = ["jpg", "jpeg", "png", "tif", "tiff", "webp"];
+
+/// Where Quick Export saves: `name-edited.ext` next to the original (`name-edited-2.ext` … if
+/// taken), keeping its format when we can write it, else JPEG. Also returns the original format's
+/// name when it had to change (e.g. "HEIC").
+pub fn edited_path(original: &Path) -> (PathBuf, Option<String>) {
+    let stem = original.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "photo".into());
+    let ext = original.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
+    let (ext, converted) = if WRITABLE.contains(&ext.to_lowercase().as_str()) {
+        (ext, None)
+    } else {
+        ("jpg".to_string(), Some(ext.to_uppercase()))
+    };
+    let dir = original.parent().unwrap_or(Path::new("."));
+    let path = (1..)
+        .map(|n| dir.join(if n == 1 { format!("{stem}-edited.{ext}") } else { format!("{stem}-edited-{n}.{ext}") }))
+        .find(|p| !p.exists())
+        .unwrap();
+    (path, converted)
+}
+
 pub fn find(slug: &str) -> Option<Size> {
     SIZES.iter().find(|s| s.slug.eq_ignore_ascii_case(slug) && s.slug != "custom").map(|s| s.size)
 }
@@ -107,6 +131,17 @@ mod tests {
     fn long_edge_never_enlarges() {
         assert_eq!(plan(Size::LongEdge(2048), FULL_CROP, (4000, 3000), false).output, (2048, 1536));
         assert_eq!(plan(Size::LongEdge(2048), FULL_CROP, (1200, 800), false).output, (1200, 800));
+    }
+
+    #[test]
+    fn edited_path_keeps_format_and_never_overwrites() {
+        let dir = std::env::temp_dir().join(format!("bp_photos_edited_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(edited_path(&dir.join("IMG_1.JPG")), (dir.join("IMG_1-edited.JPG"), None));
+        assert_eq!(edited_path(&dir.join("a.heic")), (dir.join("a-edited.jpg"), Some("HEIC".into())));
+        std::fs::write(dir.join("b-edited.png"), b"").unwrap();
+        assert_eq!(edited_path(&dir.join("b.png")).0, dir.join("b-edited-2.png"));
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
