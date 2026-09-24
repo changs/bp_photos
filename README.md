@@ -58,8 +58,12 @@ It builds libheif with only its decoders, so no GPL encoder code ends up in the 
 
 ## Keys
 
+![The command palette](docs/screenshot-palette.jpg)
+
 | | |
 |---|---|
+| `Shift+⌘P` or `⌘K` | command palette |
+| `⌘O` / `Shift+⌘O` | open a photo / a folder (opens its first photo, with the filmstrip) |
 | arrows | move through presets |
 | `[` / `]` | previous / next photo in the folder (preloaded, so it's instant) |
 | `F` | filmstrip |

@@ -8,6 +8,7 @@ mod gpu;
 mod import;
 mod loader;
 mod metadata;
+mod palette;
 mod preset;
 mod recommend;
 mod theme;

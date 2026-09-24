@@ -150,6 +150,7 @@ pub struct PhotoApp {
     /// The photo most recently asked for (it may still be loading).
     target: Option<PathBuf>,
     filmstrip: crate::filmstrip::Filmstrip,
+    palette: crate::palette::Palette,
     show_filmstrip: bool,
     /// The photo the filmstrip last scrolled to, so it follows the current photo.
     filmstrip_at: Option<PathBuf>,
@@ -231,6 +232,7 @@ impl PhotoApp {
             browser: crate::browse::Browser::new(),
             target: None,
             filmstrip: crate::filmstrip::Filmstrip::new(),
+            palette: Default::default(),
             show_filmstrip: cc.egui_ctx.data_mut(|d| d.get_persisted(egui::Id::new("show_filmstrip")).unwrap_or(false)),
             filmstrip_at: None,
             nav_cells: Vec::new(),
@@ -458,6 +460,52 @@ impl PhotoApp {
             self.browser.pending = Some(next);
         } else {
             self.open(next, ctx);
+        }
+    }
+
+    fn run_command(&mut self, command: crate::palette::Command, ctx: &egui::Context) {
+        use crate::palette::Command;
+        match command {
+            Command::OpenFile => {
+                let mut exts: Vec<&str> = loader::IMAGE_EXTENSIONS.to_vec();
+                exts.extend(loader::HEIF_EXTENSIONS);
+                exts.extend(loader::RAW_EXTENSIONS);
+                if let Some(path) = rfd::FileDialog::new().add_filter("Photos", &exts).pick_file() {
+                    self.open(path, ctx);
+                }
+            }
+            Command::OpenFolder => {
+                let Some(dir) = rfd::FileDialog::new().pick_folder() else { return };
+                match crate::browse::list_photos(&dir).into_iter().next() {
+                    Some(first) => {
+                        self.open(first, ctx);
+                        self.set_filmstrip(ctx, true);
+                    }
+                    None => self.status = format!("No photos in {}", dir.display()),
+                }
+            }
+        }
+    }
+
+    /// Shortcuts that work everywhere: the palette itself, and the commands in it.
+    fn global_shortcuts(&mut self, ctx: &egui::Context) {
+        use crate::palette::Command;
+        use egui::{KeyboardShortcut, Modifiers};
+        let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
+        let (palette, palette_k, open_folder, open_file) = ctx.input_mut(|i| {
+            (
+                i.consume_shortcut(&KeyboardShortcut::new(cmd_shift, Key::P)),
+                i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::K)),
+                i.consume_shortcut(&KeyboardShortcut::new(cmd_shift, Key::O)),
+                i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::O)),
+            )
+        });
+        if palette || palette_k {
+            self.palette.toggle();
+        } else if open_folder {
+            self.run_command(Command::OpenFolder, ctx);
+        } else if open_file {
+            self.run_command(Command::OpenFile, ctx);
         }
     }
 
@@ -1114,8 +1162,8 @@ impl PhotoApp {
             self.import_paths(presets);
         }
 
-        if self.export_dialog || ctx.egui_wants_keyboard_input() {
-            return; // dialog open, or typing in the search box
+        if self.export_dialog || self.palette.is_open() || ctx.egui_wants_keyboard_input() {
+            return; // a dialog or the palette is open, or typing in the search box
         }
         let can_export = self.photo.as_ref().is_some_and(|p| !p.provisional);
         if can_export && self.cropping.is_none() && ctx.input(|i| i.modifiers.command && i.key_pressed(Key::E)) {
@@ -1193,13 +1241,8 @@ impl PhotoApp {
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if ui.button("📂 Open…").clicked() {
-                let mut exts: Vec<&str> = loader::IMAGE_EXTENSIONS.to_vec();
-                exts.extend(loader::HEIF_EXTENSIONS);
-                exts.extend(loader::RAW_EXTENSIONS);
-                if let Some(path) = rfd::FileDialog::new().add_filter("Photos", &exts).pick_file() {
-                    self.open(path, ui.ctx());
-                }
+            if ui.button("📂 Open…").on_hover_text(format!("Open a photo ({}) · all commands: {}", crate::palette::shortcut("Cmd+O"), crate::palette::shortcut("Shift+Cmd+P"))).clicked() {
+                self.run_command(crate::palette::Command::OpenFile, ui.ctx());
             }
             if let Some(target) = self.target.clone()
                 && let Some(pos) = self.browser.position(&target)
@@ -1556,6 +1599,9 @@ impl PhotoApp {
                 self.preview_dirty = true;
                 self.side_by_side = std::env::var_os("BP_PHOTOS_SCREENSHOT_COMPARE").is_some();
                 self.show_filmstrip = std::env::var_os("BP_PHOTOS_SCREENSHOT_FILMSTRIP").is_some();
+                if std::env::var_os("BP_PHOTOS_SCREENSHOT_PALETTE").is_some() {
+                    self.palette.toggle();
+                }
                 if std::env::var_os("BP_PHOTOS_SCREENSHOT_ZOOM").is_some() {
                     self.toggle_zoom(Some([0.62, 0.45]));
                     if let (Some(z), Some(s)) = (&mut self.zoom, std::env::var("BP_PHOTOS_SCREENSHOT_ZOOM").ok().and_then(|v| v.parse::<f32>().ok())) {
@@ -1600,6 +1646,11 @@ impl eframe::App for PhotoApp {
         let visible: Vec<usize> = (0..self.presets.len())
             .filter(|&i| filter.is_empty() || self.presets[i].name.to_lowercase().contains(&filter) || self.presets[i].group.to_lowercase().contains(&filter))
             .collect();
+        self.global_shortcuts(&ctx);
+        // Before the rest of the input: the palette takes arrows/Enter/Esc while it's open.
+        if let Some(command) = self.palette.show(&ctx) {
+            self.run_command(command, &ctx);
+        }
         self.handle_input(&ctx);
 
         egui::Panel::top("toolbar").show(ui, |ui| {
