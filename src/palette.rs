@@ -6,12 +6,14 @@ use eframe::egui::{self, Key};
 pub enum Command {
     OpenFile,
     OpenFolder,
+    CopyToClipboard,
 }
 
 /// Every command: what it does, its name in the palette, and its shortcut (see [`shortcut`]).
-pub const COMMANDS: [(Command, &str, &str); 2] = [
+pub const COMMANDS: [(Command, &str, &str); 3] = [
     (Command::OpenFile, "Open File…", "Cmd+O"),
     (Command::OpenFolder, "Open Folder…", "Shift+Cmd+O"),
+    (Command::CopyToClipboard, "Copy to Clipboard", "Cmd+C"),
 ];
 
 /// A shortcut label for this platform: "Shift+⌘O" on macOS, "Shift+Ctrl+O" elsewhere.

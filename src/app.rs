@@ -484,6 +484,16 @@ impl PhotoApp {
                     None => self.status = format!("No photos in {}", dir.display()),
                 }
             }
+            // Same as ⌘C: the edited photo at the export dialog's size and crop.
+            Command::CopyToClipboard => {
+                if !self.photo.as_ref().is_some_and(|p| !p.provisional) {
+                    self.status = "Open a photo first (or wait for it to finish loading).".into();
+                } else if self.copying.is_none()
+                    && let Some(plan) = self.export_plan()
+                {
+                    self.copy_to_clipboard(plan);
+                }
+            }
         }
     }
 
