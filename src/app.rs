@@ -111,6 +111,8 @@ pub struct PhotoApp {
     photo: Option<Photo>,
     loading: Option<Receiver<LoadResult>>,
     exporting: Option<Receiver<Result<PathBuf, String>>>,
+    /// "Get Free Presets" in progress: status updates, then the number of files installed.
+    downloading: Option<Receiver<Result<String, Result<usize, String>>>>,
     /// Extra detail for the "Exported …" status (e.g. a format change on Quick Export).
     export_note: Option<String>,
     /// Resized RGBA image on its way to the clipboard.
@@ -207,6 +209,7 @@ impl PhotoApp {
             loading: None,
             exporting: None,
             export_note: None,
+            downloading: None,
             copying: None,
             clipboard: None,
             status: match &look {
@@ -488,6 +491,7 @@ impl PhotoApp {
                 }
             }
             Command::QuickExport => self.quick_export(),
+            Command::GetFreePresets => self.get_free_presets(ctx),
             // Same as ⌘C: the edited photo at the export dialog's size and crop.
             Command::CopyToClipboard => {
                 if !self.photo.as_ref().is_some_and(|p| !p.provisional) {
@@ -1100,6 +1104,49 @@ impl PhotoApp {
         self.write_export(plan, dest);
     }
 
+    /// Downloads the free preset packs into the presets folder, then loads the new ones.
+    fn get_free_presets(&mut self, ctx: &egui::Context) {
+        if self.downloading.is_some() {
+            return;
+        }
+        let (tx, rx) = channel();
+        let (dir, ctx) = (self.presets_dir.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let progress = |msg: String| {
+                _ = tx.send(Ok(msg));
+                ctx.request_repaint();
+            };
+            let result = crate::packs::install(&dir, progress);
+            _ = tx.send(Err(result));
+            ctx.request_repaint();
+        });
+        self.downloading = Some(rx);
+        self.status = "Downloading free presets…".into();
+    }
+
+    fn poll_download(&mut self) {
+        while let Some(msg) = self.downloading.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            match msg {
+                Ok(progress) => self.status = progress,
+                Err(result) => {
+                    self.downloading = None;
+                    self.status = match result {
+                        Ok(_) => {
+                            // Load whatever isn't loaded yet (re-running just refreshes the files).
+                            let known: std::collections::HashSet<PathBuf> = self.presets.iter().filter_map(|p| p.source.clone()).collect();
+                            let (all, _) = import::load_dir(&self.presets_dir);
+                            let new: Vec<Preset> = all.into_iter().filter(|p| p.source.as_ref().is_some_and(|s| !known.contains(s))).collect();
+                            let n = new.len();
+                            self.add_presets(new);
+                            if n == 0 { "Free presets are already installed and up to date.".into() } else { format!("Added {n} free presets. Their groups are in the preset list.") }
+                        }
+                        Err(e) => format!("Couldn't get free presets: {e}"),
+                    };
+                }
+            }
+        }
+    }
+
     /// Quick Export (⌘S): full size, next to the original as `name-edited.ext`, same format
     /// where we can write it (HEIC, AVIF and RAW become JPEG). No dialog.
     fn quick_export(&mut self) {
@@ -1163,6 +1210,7 @@ impl PhotoApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
         self.poll_recommendations(ctx);
+        self.poll_download();
         if let Some(rx) = &self.copying {
             if let Ok((w, h, rgba)) = rx.try_recv() {
                 self.copying = None;

@@ -17,10 +17,11 @@ const USAGE: &str = "usage:
       --edited  save next to each original as NAME-edited.EXT, same format where possible (no --out)
   bp_photos sheet PHOTO OUT.jpg [FILTER]              contact sheet of every preset (optionally filtered)
   bp_photos presets                                   list installed presets and any that fail to load
-  bp_photos recommend PHOTO [SHEET.jpg]               presets recommended for a photo (and a sheet of them)";
+  bp_photos recommend PHOTO [SHEET.jpg]               presets recommended for a photo (and a sheet of them)
+  bp_photos get-presets [DIR]                         download the free preset packs (into DIR, or the presets folder)";
 
 pub fn is_command(arg: &str) -> bool {
-    matches!(arg, "apply" | "sheet" | "presets" | "bench" | "recommend" | "--help" | "-h")
+    matches!(arg, "apply" | "sheet" | "presets" | "bench" | "recommend" | "get-presets" | "--help" | "-h")
 }
 
 pub fn run(args: &[String]) -> Result<(), String> {
@@ -43,6 +44,12 @@ pub fn run(args: &[String]) -> Result<(), String> {
             for e in &errors {
                 println!("  failed: {e}");
             }
+            Ok(())
+        }
+        "get-presets" => {
+            let dir = args.get(1).map(PathBuf::from).unwrap_or_else(app::presets_dir);
+            let n = crate::packs::install(&dir, |msg| println!("{msg}"))?;
+            println!("{n} preset files in {}", dir.display());
             Ok(())
         }
         "recommend" => {

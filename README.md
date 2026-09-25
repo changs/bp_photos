@@ -37,6 +37,12 @@ Works on macOS and Linux.
 Lightroom's processing isn't public, so presets come out close to Lightroom, not identical. Masks,
 profiles, sharpening, noise reduction and lens corrections are ignored.
 
+## Private by design
+
+Everything happens on your computer. Photos are never uploaded, there's no account, no analytics
+and no telemetry. The app only goes online if you run *Get Free Presets*, which downloads the two
+preset collections listed below from GitHub.
+
 ## Download
 
 macOS 12 or later, Apple silicon: grab the `.dmg` from
@@ -93,9 +99,15 @@ bp_photos bench photo.heic           # time each loading step
 
 ## Presets
 
-A couple of dozen are built in. For more, these work well and are MIT licensed:
+A couple of dozen are built in. Run *Get Free Presets* from the command palette (`Shift+⌘P`) to
+download these two MIT-licensed collections (about 30 MB, 750 looks), pinned to reviewed versions:
 
 - [peva3/Lightroom-Presets](https://github.com/peva3/Lightroom-Presets): ~450 film looks (`.xmp`)
 - [YahiaAngelo/Film-Luts](https://github.com/YahiaAngelo/Film-Luts): ~300 film LUTs (`.cube`)
 
-The screenshot uses a public-domain sample from [raw.pixls.us](https://raw.pixls.us).
+The screenshots use public-domain samples from [raw.pixls.us](https://raw.pixls.us).
+
+## Licence
+
+MIT, see [LICENSE](LICENSE). The macOS app bundles libheif, libde265 (both LGPL-3.0) and dav1d
+(BSD-2-Clause); their licences are in `BP Photos.app/Contents/Resources/Licenses`.
