@@ -9,15 +9,21 @@ pub enum Command {
     QuickExport,
     CopyToClipboard,
     GetFreePresets,
+    ImportPresetFiles,
+    ImportPresetFolder,
+    ShowPresetsFolder,
 }
 
 /// Every command: what it does, its name in the palette, and its shortcut (see [`shortcut`]).
-pub const COMMANDS: [(Command, &str, &str); 5] = [
+pub const COMMANDS: [(Command, &str, &str); 8] = [
     (Command::OpenFile, "Open File…", "Cmd+O"),
     (Command::OpenFolder, "Open Folder…", "Shift+Cmd+O"),
     (Command::QuickExport, "Quick Export (save as name-edited)", "Cmd+S"),
     (Command::CopyToClipboard, "Copy to Clipboard", "Cmd+C"),
     (Command::GetFreePresets, "Get Free Presets (750 film looks, 30 MB download)", ""),
+    (Command::ImportPresetFiles, "Import Presets… (.xmp, .lrtemplate, .cube)", ""),
+    (Command::ImportPresetFolder, "Import Preset Folder…", ""),
+    (Command::ShowPresetsFolder, "Show Presets Folder", ""),
 ];
 
 /// A shortcut label for this platform: "Shift+⌘O" on macOS, "Shift+Ctrl+O" elsewhere.

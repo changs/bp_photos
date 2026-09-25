@@ -132,6 +132,26 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>$MIN_OS</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.photography</string>
   <key>NSHighResolutionCapable</key><true/>
+  <!-- Listed under Finder's "Open With" for photos, but never the default app ("Alternate"). -->
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key><string>Photo</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.jpeg</string>
+        <string>public.png</string>
+        <string>public.tiff</string>
+        <string>org.webmproject.webp</string>
+        <string>public.heic</string>
+        <string>public.heif</string>
+        <string>public.avif</string>
+        <string>public.camera-raw-image</string>
+      </array>
+    </dict>
+  </array>
 </dict>
 </plist>
 PLIST

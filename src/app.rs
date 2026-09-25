@@ -38,6 +38,9 @@ struct Photo {
     thumb_size: (u32, u32),
     /// Per preset; created and rendered only once the thumbnail is on screen.
     thumbs: Vec<Option<Thumb>>,
+    /// For the status bar: the photo's colour space, and how long it took to load.
+    colour: &'static str,
+    load_ms: u128,
 }
 
 struct Thumb {
@@ -66,6 +69,13 @@ struct ExportSettings {
 }
 
 const FORMATS: [(&str, &str); 3] = [("JPEG", "jpg"), ("PNG", "png"), ("TIFF", "tif")];
+
+/// What the right-hand panel shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PanelTab {
+    Presets,
+    Info,
+}
 
 /// Zoomed-in view: the photo point (normalised) at the centre, and screen pixels per photo pixel.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -123,6 +133,14 @@ pub struct PhotoApp {
     filter: String,
     show_original: bool,
     side_by_side: bool,
+    /// Split view: original left of a draggable divider, edit on the right.
+    split_view: bool,
+    /// Divider position across the photo, 0..1.
+    split_pos: f32,
+    /// Dragging the divider while zoomed (otherwise dragging pans).
+    split_drag: bool,
+    /// Where the split photo was drawn last frame, for hit-testing the divider.
+    split_rect: Option<Rect>,
     cropping: Option<CropEdit>,
     /// Index into `crop::RATIOS`, and whether it's rotated 90°.
     crop_ratio: usize,
@@ -158,6 +176,11 @@ pub struct PhotoApp {
     show_filmstrip: bool,
     /// The photo the filmstrip last scrolled to, so it follows the current photo.
     filmstrip_at: Option<PathBuf>,
+    panel_tab: PanelTab,
+    /// Metadata of the current photo for the Info tab (read in the background), with its
+    /// file size, keyed by path.
+    info: Option<(PathBuf, crate::metadata::Summary, Option<u64>)>,
+    info_rx: Option<Receiver<(PathBuf, crate::metadata::Summary, Option<u64>)>>,
     /// Presets recommended for the current photo, best first.
     recs: Vec<crate::recommend::Rec>,
     /// Recommendations need recomputing (new photo, crop or presets).
@@ -198,6 +221,8 @@ impl PhotoApp {
         let gpu = Gpu::new(rs.device.clone(), rs.queue.clone());
         let presets_dir = presets_dir();
         let look = crate::theme::apply_ghostty(&cc.egui_ctx);
+        #[cfg(target_os = "macos")]
+        crate::macos::set_context(&cc.egui_ctx);
         let mut app = Self {
             gpu,
             renderer: rs.renderer.clone(),
@@ -219,6 +244,10 @@ impl PhotoApp {
             filter: String::new(),
             show_original: false,
             side_by_side: false,
+            split_view: false,
+            split_pos: 0.5,
+            split_drag: false,
+            split_rect: None,
             cropping: None,
             crop_ratio: 0,
             crop_flip: false,
@@ -230,6 +259,9 @@ impl PhotoApp {
             thumb_queue: Vec::new(),
             opened_at: None,
             recs: Vec::new(),
+            panel_tab: PanelTab::Presets,
+            info: None,
+            info_rx: None,
             egui_ctx: cc.egui_ctx.clone(),
             zoom: None,
             zoom_drag: None,
@@ -376,12 +408,25 @@ impl PhotoApp {
         let ppp = ui.ctx().pixels_per_point();
         let cells = self.zoom_cells(rect);
 
-        // Pan: dragging moves the photo with the pointer.
+        // Pan: dragging moves the photo with the pointer (or the split divider, if grabbed).
         let Zoom { mut center, scale } = self.zoom.unwrap();
+        let near_divider = |p: egui::Pos2, r: Rect, t: f32| (p.x - (r.min.x + t * r.width())).abs() < 14.0 && r.y_range().contains(p.y);
         if response.drag_started()
             && let Some(p) = ui.input(|i| i.pointer.press_origin())
         {
-            self.zoom_drag = Some((p, center));
+            if self.split_view && self.split_rect.is_some_and(|r| near_divider(p, r, self.split_pos)) {
+                self.split_drag = true;
+            } else {
+                self.zoom_drag = Some((p, center));
+            }
+        }
+        if self.split_drag {
+            if let (Some(p), Some(r)) = (response.interact_pointer_pos(), self.split_rect) {
+                self.split_pos = ((p.x - r.min.x) / r.width()).clamp(0.0, 1.0);
+            }
+            if !response.dragged() {
+                self.split_drag = false;
+            }
         }
         if let Some((origin, start)) = self.zoom_drag {
             if let Some(p) = response.interact_pointer_pos() {
@@ -425,11 +470,24 @@ impl PhotoApp {
         };
         let name = &self.presets[self.selected].name;
         let after = shown(*cells.last().unwrap());
+        let pct = format!("{:.0}%", scale * 100.0);
+        if self.split_view && !self.side_by_side {
+            paint_split(&painter, after, z.original.1, z.edited.1, self.split_pos, &format!("Original · {pct}"), &format!("{name} · {pct}"));
+            self.split_rect = Some(after);
+            let hover = response.hover_pos().is_some_and(|p| near_divider(p, after, self.split_pos));
+            ui.ctx().set_cursor_icon(if self.split_drag || hover {
+                egui::CursorIcon::ResizeHorizontal
+            } else if self.zoom_drag.is_some() {
+                egui::CursorIcon::Grabbing
+            } else {
+                egui::CursorIcon::Grab
+            });
+            return after;
+        }
         painter.image(z.edited.1, after, uv, Color32::WHITE);
         if self.side_by_side {
             painter.image(z.original.1, shown(cells[0]), uv, Color32::WHITE);
         }
-        let pct = format!("{:.0}%", scale * 100.0);
         if self.side_by_side {
             badge(&painter, shown(cells[0]), &format!("Before · {pct}"));
             badge(&painter, after, &format!("{name} · {pct}"));
@@ -491,6 +549,20 @@ impl PhotoApp {
                 }
             }
             Command::QuickExport => self.quick_export(),
+            Command::ImportPresetFiles => {
+                if let Some(files) = rfd::FileDialog::new().add_filter("Presets", &import::PRESET_EXTENSIONS).pick_files() {
+                    self.import_paths(files);
+                }
+            }
+            Command::ImportPresetFolder => {
+                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                    self.import_paths(vec![dir]);
+                }
+            }
+            Command::ShowPresetsFolder => {
+                _ = std::fs::create_dir_all(&self.presets_dir);
+                _ = open_in_file_manager(&self.presets_dir);
+            }
             Command::GetFreePresets => self.get_free_presets(ctx),
             // Same as ⌘C: the edited photo at the export dialog's size and crop.
             Command::CopyToClipboard => {
@@ -519,6 +591,17 @@ impl PhotoApp {
                 i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::S)),
             )
         });
+        // ⌘1–⌘9: the recommended presets, in order.
+        let digits = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9];
+        let pick = ctx.input_mut(|i| digits.iter().position(|&k| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, k))));
+        if let Some(n) = pick
+            && let Some(rec) = self.recs.get(n)
+            && self.photo.is_some()
+        {
+            self.selected_section = "recommended".into();
+            self.select(rec.index);
+            self.scroll_to_selected = true;
+        }
         if palette || palette_k {
             self.palette.toggle();
         } else if open_folder {
@@ -528,6 +611,43 @@ impl PhotoApp {
         } else if quick_export && self.cropping.is_none() {
             self.run_command(Command::QuickExport, ctx);
         }
+    }
+
+    /// Folder · file · size · colour · load time on the left; messages (exported, copied, errors)
+    /// on the right.
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let small = |t: String| egui::RichText::new(t).small();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            if let Some(photo) = &self.photo {
+                let dir = photo.path.parent().map(Path::to_path_buf).unwrap_or_default();
+                folder_icon(ui);
+                let folder = ui
+                    .add(egui::Label::new(small(short_dir(&dir))).sense(Sense::click()))
+                    .on_hover_text(format!("{}\nClick to show in Finder", dir.display()));
+                if folder.clicked() {
+                    _ = open_in_file_manager(&dir);
+                }
+                ui.separator();
+                ui.label(small(photo.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
+                ui.separator();
+                let (w, h) = photo.size();
+                let mut size = format!("{w} × {h}");
+                if photo.crop != FULL_CROP {
+                    let (cw, ch) = crop::pixel_size(photo.crop, photo.size());
+                    size += &format!("  (crop {cw} × {ch})");
+                }
+                ui.label(small(size));
+                ui.separator();
+                ui.label(small(photo.colour.to_string()));
+                ui.separator();
+                ui.label(small(if photo.provisional { "preview".into() } else { format!("{} ms", photo.load_ms) }))
+                    .on_hover_text("Time to open the photo");
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add(egui::Label::new(small(self.status.clone()).weak()).truncate());
+            });
+        });
     }
 
     fn set_filmstrip(&mut self, ctx: &egui::Context, show: bool) {
@@ -603,6 +723,16 @@ impl PhotoApp {
     }
 
     fn finish_load(&mut self, path: PathBuf, decoded: Decoded, start: Instant, provisional: bool) {
+        let ext = import::extension(&path).unwrap_or_default();
+        let colour = if loader::RAW_EXTENSIONS.contains(&ext.as_str()) {
+            "RAW"
+        } else if decoded.p3 {
+            "Display P3"
+        } else if matches!(decoded.pixels, loader::Pixels::LinearF16(_)) {
+            "16-bit"
+        } else {
+            "sRGB"
+        };
         let source = self.gpu.upload(&decoded);
         let size = (decoded.width, decoded.height);
         // Upgrading the embedded preview to the full image keeps the crop (and crop tool) as is.
@@ -634,19 +764,27 @@ impl PhotoApp {
             thumb_crop: FULL_CROP,
             thumb_size: fit(size, THUMB_MAX),
             thumbs: Vec::new(),
+            colour,
+            load_ms: start.elapsed().as_millis(),
         });
         self.preview_dirty = true;
         self.original_dirty = true;
         self.recs_dirty = true;
         self.zoom_dirty = true;
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let ms = start.elapsed().as_millis();
-        self.status = if provisional {
-            format!("{name} — preview in {ms} ms, loading full resolution…")
-        } else {
-            format!("{name} — {}×{} — loaded in {ms} ms", size.0, size.1)
-        };
+        // The photo's details are in the status bar's own segments; this is only for messages.
+        self.status = if provisional { "Loading full resolution…".into() } else { String::new() };
         self.opened_at = Some((start, provisional));
+        if !provisional && self.info.as_ref().is_none_or(|(p, ..)| *p != path) {
+            let (tx, rx) = channel();
+            let (path, ctx) = (path.clone(), self.egui_ctx.clone());
+            std::thread::spawn(move || {
+                let summary = crate::metadata::summary(&path);
+                let bytes = std::fs::metadata(&path).ok().map(|m| m.len());
+                _ = tx.send((path, summary, bytes));
+                ctx.request_repaint();
+            });
+            self.info_rx = Some(rx);
+        }
         if !provisional {
             let ctx = self.egui_ctx.clone();
             self.browser.prefetch(&path, self.gpu.max_dim(), &ctx);
@@ -1211,6 +1349,10 @@ impl PhotoApp {
         }
         self.poll_recommendations(ctx);
         self.poll_download();
+        if let Some(info) = self.info_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.info = Some(info);
+            self.info_rx = None;
+        }
         if let Some(rx) = &self.copying {
             if let Ok((w, h, rgba)) = rx.try_recv() {
                 self.copying = None;
@@ -1284,6 +1426,19 @@ impl PhotoApp {
         if ctx.input(|i| plain_key(i, Key::C)) {
             self.start_crop();
         }
+        if ctx.input(|i| plain_key(i, Key::S)) {
+            self.split_view = !self.split_view;
+            self.side_by_side &= !self.split_view;
+        }
+        // "/" jumps to preset search (without typing the slash into it).
+        if ctx.input(|i| plain_key(i, Key::I)) {
+            self.panel_tab = if self.panel_tab == PanelTab::Info { PanelTab::Presets } else { PanelTab::Info };
+        }
+        if ctx.input(|i| plain_key(i, Key::Slash)) {
+            self.panel_tab = PanelTab::Presets;
+            ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Text(t) if t == "/")));
+            ctx.memory_mut(|m| m.request_focus(egui::Id::new("preset_search")));
+        }
         if ctx.input(|i| plain_key(i, Key::F)) {
             self.set_filmstrip(ctx, !self.show_filmstrip);
         }
@@ -1301,6 +1456,7 @@ impl PhotoApp {
         }
         if ctx.input(|i| plain_key(i, Key::Y)) {
             self.side_by_side = !self.side_by_side;
+            self.split_view &= !self.side_by_side;
         }
         let keys = ctx.input(|i| {
             [Key::ArrowLeft, Key::ArrowRight, Key::ArrowUp, Key::ArrowDown].map(|k| i.key_pressed(k))
@@ -1351,38 +1507,13 @@ impl PhotoApp {
                 self.export_dialog = true;
             }
             ui.separator();
-            ui.menu_button("➕ Import presets", |ui| {
-                if ui.button("Files (.xmp, .lrtemplate, .cube)…").clicked() {
-                    if let Some(files) = rfd::FileDialog::new().add_filter("Presets", &import::PRESET_EXTENSIONS).pick_files() {
-                        self.import_paths(files);
-                    }
-                    ui.close();
-                }
-                if ui.button("Folder…").clicked() {
-                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                        self.import_paths(vec![dir]);
-                    }
-                    ui.close();
-                }
-                if ui.button("Show presets folder").clicked() {
-                    _ = std::fs::create_dir_all(&self.presets_dir);
-                    _ = open_in_file_manager(&self.presets_dir);
-                    ui.close();
-                }
-            });
-            ui.separator();
-            ui.label("Amount");
-            let slider = ui.add(egui::Slider::new(&mut self.strength, 0.0..=1.5).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
-            if slider.changed() {
-                self.preview_dirty = true;
-            }
-            if slider.double_clicked() {
-                self.strength = 1.0;
-                self.preview_dirty = true;
-            }
-            ui.separator();
             ui.add_enabled_ui(self.cropping.is_none(), |ui| {
-                ui.toggle_value(&mut self.side_by_side, "◫ Before / After").on_hover_text("Show the original next to the edit (Y)");
+                if ui.toggle_value(&mut self.split_view, "⇆ Split").on_hover_text("Original and edit on either side of a divider you drag (S)").changed() && self.split_view {
+                    self.side_by_side = false;
+                }
+                if ui.toggle_value(&mut self.side_by_side, "◫ Before / After").on_hover_text("Show the original next to the edit (Y)").changed() && self.side_by_side {
+                    self.split_view = false;
+                }
             });
             if ui.add(egui::Button::selectable(self.show_filmstrip, "🎞 Filmstrip")).on_hover_text("Show the folder's photos along the bottom (F)").clicked() {
                 let show = !self.show_filmstrip;
@@ -1414,13 +1545,113 @@ impl PhotoApp {
         });
     }
 
-    fn preset_panel(&mut self, ui: &mut egui::Ui, visible: &[usize]) {
-        ui.add_space(6.0);
+    /// The right-hand panel: PRESETS and INFO tabs.
+    fn side_panel(&mut self, ui: &mut egui::Ui, visible: &[usize]) {
+        ui.add_space(10.0);
         ui.horizontal(|ui| {
-            ui.label("🔍");
-            ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("Filter presets").desired_width(f32::INFINITY));
+            ui.spacing_mut().item_spacing.x = 20.0;
+            for (tab, label) in [(PanelTab::Presets, "PRESETS"), (PanelTab::Info, "INFO")] {
+                let active = self.panel_tab == tab;
+                let color = if active { ui.visuals().strong_text_color() } else { ui.visuals().weak_text_color() };
+                let text = egui::RichText::new(label).strong().size(14.0).extra_letter_spacing(1.5).color(color);
+                let response = ui.add(egui::Label::new(text).sense(Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand);
+                if active {
+                    let r = response.rect;
+                    let y = r.max.y + 5.0;
+                    ui.painter().line_segment([egui::pos2(r.min.x, y), egui::pos2(r.max.x, y)], Stroke::new(2.0, ui.visuals().selection.bg_fill));
+                }
+                if response.clicked() {
+                    self.panel_tab = tab;
+                }
+            }
         });
-        ui.add_space(4.0);
+        ui.add_space(8.0);
+        ui.separator();
+        match self.panel_tab {
+            PanelTab::Presets => self.preset_panel(ui, visible),
+            PanelTab::Info => self.info_panel(ui),
+        }
+    }
+
+    /// The photo's file, image and EXIF details.
+    fn info_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(photo) = &self.photo else {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Open a photo to see its details.").weak());
+            return;
+        };
+        let (w, h) = photo.size();
+        let ext = photo.path.extension().map(|e| e.to_string_lossy().to_uppercase()).unwrap_or_default();
+        let info = self.info.as_ref().filter(|(p, ..)| *p == photo.path);
+        let mut file = vec![
+            ("Name", photo.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
+            ("Folder", photo.path.parent().map(short_dir).unwrap_or_default()),
+            ("Format", ext),
+        ];
+        if let Some(bytes) = info.and_then(|(.., b)| *b) {
+            file.push(("Size", human_bytes(bytes)));
+        }
+        let mut image = vec![
+            ("Dimensions", format!("{w} × {h}")),
+            ("Megapixels", format!("{:.1} MP", w as f64 * h as f64 / 1e6)),
+            ("Colour", photo.colour.to_string()),
+        ];
+        if photo.crop != FULL_CROP {
+            let (cw, ch) = crop::pixel_size(photo.crop, photo.size());
+            image.push(("Crop", format!("{cw} × {ch}")));
+        }
+        let mut sections: Vec<(&str, Vec<(&str, String)>)> = vec![("FILE", file), ("IMAGE", image)];
+        let location = info.and_then(|(_, s, _)| s.location);
+        if let Some((_, summary, _)) = info {
+            sections.extend(summary.sections.iter().cloned());
+        }
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            for (title, rows) in &sections {
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new(*title).small().strong().extra_letter_spacing(1.2).color(ui.visuals().weak_text_color()));
+                ui.add_space(4.0);
+                egui::Grid::new(("info", *title)).num_columns(2).spacing([12.0, 5.0]).show(ui, |ui| {
+                    for (label, value) in rows {
+                        // Same label width in every section, so the values line up.
+                        ui.allocate_ui_with_layout(Vec2::new(104.0, 16.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.set_min_width(104.0);
+                            ui.label(egui::RichText::new(*label).weak());
+                        });
+                        ui.add(egui::Label::new(value).wrap());
+                        ui.end_row();
+                    }
+                });
+                if *title == "LOCATION"
+                    && let Some((lat, lon)) = location
+                {
+                    ui.add_space(6.0);
+                    if ui.button("Show in Maps").clicked() {
+                        _ = open_map(lat, lon);
+                    }
+                }
+            }
+            if info.is_none() {
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("Reading metadata…").weak());
+            } else if sections.len() == 2 {
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("No camera metadata in this file.").weak());
+            }
+        });
+    }
+
+    fn preset_panel(&mut self, ui: &mut egui::Ui, visible: &[usize]) {
+        // Amount, pinned under the list.
+        egui::Panel::bottom("amount").frame(egui::Frame::NONE).show(ui, |ui| self.amount_control(ui));
+        ui.add_space(6.0);
+        ui.add(
+            egui::TextEdit::singleline(&mut self.filter)
+                .id(egui::Id::new("preset_search"))
+                .hint_text("/  Search presets…")
+                .desired_width(f32::INFINITY)
+                .margin(egui::vec2(8.0, 5.0)),
+        );
+        ui.add_space(6.0);
 
         let mut groups: Vec<String> = Vec::new();
         for &i in visible {
@@ -1488,6 +1719,49 @@ impl PhotoApp {
         }
     }
 
+    /// "AMOUNT 75%" and a slider from 0 to 150% (with a mark at 100%). Double-click resets it.
+    fn amount_control(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("AMOUNT").strong().extra_letter_spacing(1.2));
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new(format!("{:.0}%", self.strength * 100.0)).strong());
+        });
+        ui.add_space(6.0);
+        let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 18.0), Sense::click_and_drag());
+        const MAX: f32 = 1.5;
+        if (response.dragged() || response.clicked())
+            && let Some(p) = response.interact_pointer_pos()
+        {
+            let v = ((p.x - rect.min.x) / rect.width() * MAX).clamp(0.0, MAX);
+            // A little stickiness at 100%.
+            self.strength = if (v - 1.0).abs() < 0.02 { 1.0 } else { v };
+            self.preview_dirty = true;
+        }
+        if response.double_clicked() {
+            self.strength = 1.0;
+            self.preview_dirty = true;
+        }
+        let v = ui.visuals();
+        let accent = v.selection.bg_fill;
+        let track = Rect::from_center_size(rect.center(), Vec2::new(rect.width(), 6.0));
+        let x = track.min.x + track.width() * self.strength / MAX;
+        let painter = ui.painter();
+        painter.rect_filled(track, 3.0, v.widgets.inactive.bg_fill);
+        painter.rect_filled(Rect::from_min_max(track.min, egui::pos2(x, track.max.y)), 3.0, accent);
+        let tick = track.min.x + track.width() / MAX;
+        painter.line_segment([egui::pos2(tick, track.min.y - 3.0), egui::pos2(tick, track.max.y + 3.0)], Stroke::new(1.0, v.weak_text_color()));
+        let handle = Rect::from_center_size(egui::pos2(x.clamp(track.min.x + 5.0, track.max.x - 5.0), track.center().y), Vec2::new(10.0, 16.0));
+        painter.rect(handle, 3.0, accent.lerp_to_gamma(Color32::WHITE, 0.3), Stroke::new(1.0, accent), egui::StrokeKind::Middle);
+        if response.hovered() || response.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+        response.on_hover_text("Drag to change · double-click for 100% · or scroll over the photo");
+        ui.add_space(10.0);
+    }
+
     /// The thumbnail texture for a preset, creating it and queueing a render if needed.
     /// Called while laying out the grid, so only thumbnails on screen are ever rendered.
     fn thumb_for(&mut self, index: usize) -> Option<TextureId> {
@@ -1539,6 +1813,17 @@ impl PhotoApp {
             Stroke::NONE
         };
         painter.rect_stroke(img_rect, 4.0, stroke, egui::StrokeKind::Outside);
+        // Shortcut hint on the first nine recommendations.
+        if section == "recommended"
+            && let Some(rank) = self.recs.iter().position(|r| r.index == index).filter(|&r| r < 9)
+        {
+            let text = crate::palette::shortcut(&format!("Cmd+{}", rank + 1));
+            let galley = painter.layout_no_wrap(text, egui::FontId::proportional(11.5), Color32::WHITE);
+            let pos = img_rect.right_top() + Vec2::new(-8.0 - galley.size().x, 7.0);
+            let bg = Rect::from_min_size(pos, galley.size()).expand2(Vec2::new(5.0, 2.5));
+            painter.rect(bg, 4.0, Color32::from_black_alpha(200), Stroke::new(1.0, Color32::from_white_alpha(70)), egui::StrokeKind::Inside);
+            painter.galley(pos, galley, Color32::WHITE);
+        }
         let name = &self.presets[index].name;
         let galley = ui.painter().layout(
             name.clone(),
@@ -1573,6 +1858,14 @@ impl PhotoApp {
         match &self.photo {
             Some(_) if zoomed => {
                 edited_rect = Some(self.zoom_view(ui, rect, &response));
+            }
+            Some(photo) if self.split_view => {
+                let r = fit_rect(rect.shrink(12.0), (photo.preview.width, photo.preview.height));
+                let name = &self.presets[self.selected].name;
+                paint_split(&painter, r, photo.original_id, photo.preview_id, self.split_pos, "Original", name);
+                self.split_rect = Some(r);
+                edited_rect = Some(r);
+                fitted = vec![(r, photo.view_crop)];
             }
             Some(photo) if self.side_by_side => {
                 let size = (photo.preview.width, photo.preview.height);
@@ -1620,6 +1913,20 @@ impl PhotoApp {
             }
         }
 
+        // Split view (not zoomed): press or drag anywhere on the photo to move the divider.
+        if self.split_view
+            && !zoomed
+            && let Some(r) = self.split_rect
+        {
+            if response.is_pointer_button_down_on()
+                && let Some(p) = response.interact_pointer_pos()
+            {
+                self.split_pos = ((p.x - r.min.x) / r.width()).clamp(0.0, 1.0);
+            }
+            if response.hover_pos().is_some_and(|p| r.contains(p)) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            }
+        }
         self.handle_pinch(ui, rect, &response, &fitted);
         // Double-click zooms to 100% at that spot, or back out.
         if response.double_clicked() && self.photo.is_some() {
@@ -1631,7 +1938,7 @@ impl PhotoApp {
             self.toggle_zoom(at);
         }
         // Holding the mouse shows the original, except at 100% where dragging pans.
-        let held = response.is_pointer_button_down_on() && !zoomed;
+        let held = response.is_pointer_button_down_on() && !zoomed && !self.split_view;
         let original = !self.side_by_side && (held || ui.input(|i| i.key_down(Key::Backslash)));
         if original != self.show_original {
             self.show_original = original;
@@ -1677,6 +1984,7 @@ impl PhotoApp {
         let ready = self.photo.as_ref().is_some_and(|p| !p.provisional) && !self.recs.is_empty() && settled;
         // Wait for filmstrip thumbnails too, once it's shown (from frame 1).
         let ready = ready && !(*frames > 0 && self.show_filmstrip && self.filmstrip.loading());
+        let ready = ready && !(*frames > 0 && self.panel_tab == PanelTab::Info && self.info_rx.is_some());
         let frames = if ready { frames + 1 } else { *frames };
         if let Some((_, f)) = &mut self.screenshot {
             *f = frames;
@@ -1687,6 +1995,10 @@ impl PhotoApp {
                 self.selected = self.recs[0].index;
                 self.preview_dirty = true;
                 self.side_by_side = std::env::var_os("BP_PHOTOS_SCREENSHOT_COMPARE").is_some();
+                self.split_view = std::env::var_os("BP_PHOTOS_SCREENSHOT_SPLIT").is_some();
+                if std::env::var_os("BP_PHOTOS_SCREENSHOT_INFO").is_some() {
+                    self.panel_tab = PanelTab::Info;
+                }
                 self.show_filmstrip = std::env::var_os("BP_PHOTOS_SCREENSHOT_FILMSTRIP").is_some();
                 if std::env::var_os("BP_PHOTOS_SCREENSHOT_PALETTE").is_some() {
                     self.palette.toggle();
@@ -1735,6 +2047,22 @@ impl eframe::App for PhotoApp {
         let visible: Vec<usize> = (0..self.presets.len())
             .filter(|&i| filter.is_empty() || self.presets[i].name.to_lowercase().contains(&filter) || self.presets[i].group.to_lowercase().contains(&filter))
             .collect();
+        // The menu bar's "Presets" menu: added once the app's menu exists, then its clicks.
+        #[cfg(target_os = "macos")]
+        {
+            crate::macos::install_menu();
+            for command in crate::macos::take_menu_commands() {
+                self.run_command(command, &ctx);
+            }
+        }
+        // Photos opened from Finder ("Open With", the Dock icon): show the last one.
+        #[cfg(target_os = "macos")]
+        if let Some(path) = crate::macos::take_opened().into_iter().filter(|p| loader::is_photo(p)).last() {
+            if std::env::var_os("BP_PHOTOS_TIMING").is_some() {
+                eprintln!("opened from Finder: {}", path.display());
+            }
+            self.open(path, &ctx);
+        }
         self.global_shortcuts(&ctx);
         // Before the rest of the input: the palette takes arrows/Enter/Esc while it's open.
         if let Some(command) = self.palette.show(&ctx) {
@@ -1754,7 +2082,7 @@ impl eframe::App for PhotoApp {
                 ui.add_space(2.0);
             });
         }
-        egui::Panel::bottom("status").show(ui, |ui| ui.label(egui::RichText::new(&self.status).small()));
+        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
         if self.show_filmstrip {
             egui::Panel::bottom("filmstrip").resizable(false).show(ui, |ui| {
                 ui.add_space(4.0);
@@ -1762,7 +2090,7 @@ impl eframe::App for PhotoApp {
                 ui.add_space(2.0);
             });
         }
-        egui::Panel::right("presets").resizable(true).default_size(330.0).size_range(200.0..=1200.0).show(ui, |ui| self.preset_panel(ui, &visible));
+        egui::Panel::right("presets").resizable(true).default_size(330.0).size_range(200.0..=1200.0).show(ui, |ui| self.side_panel(ui, &visible));
         egui::CentralPanel::default().show(ui, |ui| self.preview(ui));
         if self.export_dialog {
             self.export_dialog(&ctx);
@@ -1833,6 +2161,34 @@ fn split_for(rect: Rect, size: (u32, u32), gap: f32) -> (Rect, Rect) {
     }
 }
 
+/// The split view: `before` left of a divider at `t` (0..1 across `r`), `after` right of it,
+/// with a round handle and a label on each side.
+fn paint_split(painter: &egui::Painter, r: Rect, before: TextureId, after: TextureId, t: f32, before_label: &str, after_label: &str) {
+    let x = r.min.x + r.width() * t;
+    let left = Rect::from_min_max(r.min, egui::pos2(x, r.max.y));
+    let right = Rect::from_min_max(egui::pos2(x, r.min.y), r.max);
+    painter.image(before, left, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(t, 1.0)), Color32::WHITE);
+    painter.image(after, right, Rect::from_min_max(egui::pos2(t, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+
+    let white = Stroke::new(2.0, Color32::WHITE);
+    painter.line_segment([egui::pos2(x, r.min.y), egui::pos2(x, r.max.y)], Stroke::new(1.5, Color32::from_white_alpha(230)));
+    let c = egui::pos2(x, r.center().y);
+    painter.circle(c, 17.0, Color32::from_black_alpha(90), white);
+    for dir in [-1.0f32, 1.0] {
+        let tip = c + Vec2::new(dir * 9.0, 0.0);
+        let back = c + Vec2::new(dir * 3.5, 0.0);
+        painter.line_segment([back + Vec2::new(0.0, -5.0), tip], white);
+        painter.line_segment([back + Vec2::new(0.0, 5.0), tip], white);
+    }
+    // Labels only where there's room for them.
+    if left.width() > 130.0 {
+        badge(painter, left, before_label);
+    }
+    if right.width() > 130.0 {
+        badge(painter, right, after_label);
+    }
+}
+
 /// "Amount 85%" with a small bar, centred near the bottom of the photo.
 fn amount_overlay(painter: &egui::Painter, image: Rect, amount: f32, alpha: f32) {
     let fade = |c: Color32| c.gamma_multiply(alpha);
@@ -1894,6 +2250,52 @@ pub fn save_image(img: &image::RgbImage, dest: &Path, jpeg_quality: u8, exif: Op
         }
         _ => img.save(dest).map_err(err),
     }
+}
+
+/// A small outline folder, drawn (the emoji differs from font to font).
+fn folder_icon(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(14.0, 12.0), Sense::hover());
+    let stroke = Stroke::new(1.2, ui.visuals().text_color());
+    let body = Rect::from_min_max(rect.min + Vec2::new(0.0, 3.0), rect.max);
+    let tab = [rect.min + Vec2::new(0.0, 3.0), rect.min + Vec2::new(0.0, 1.0), rect.min + Vec2::new(5.0, 1.0), rect.min + Vec2::new(6.5, 3.0)];
+    ui.painter().rect_stroke(body, 2.0, stroke, egui::StrokeKind::Middle);
+    ui.painter().line(tab.to_vec(), stroke);
+}
+
+/// "4.2 MB".
+fn human_bytes(n: u64) -> String {
+    match n {
+        n if n >= 1 << 30 => format!("{:.1} GB", n as f64 / (1u64 << 30) as f64),
+        n if n >= 1 << 20 => format!("{:.1} MB", n as f64 / (1u64 << 20) as f64),
+        n if n >= 1 << 10 => format!("{:.0} KB", n as f64 / (1u64 << 10) as f64),
+        n => format!("{n} bytes"),
+    }
+}
+
+/// Opens a map at a position: Apple Maps on macOS, OpenStreetMap elsewhere.
+fn open_map(lat: f64, lon: f64) -> std::io::Result<std::process::Child> {
+    let url = if cfg!(target_os = "macos") {
+        format!("https://maps.apple.com/?ll={lat},{lon}&q=Photo")
+    } else {
+        format!("https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=15/{lat}/{lon}")
+    };
+    let cmd = if cfg!(target_os = "macos") { "open" } else if cfg!(windows) { "explorer" } else { "xdg-open" };
+    std::process::Command::new(cmd).arg(url).spawn()
+}
+
+/// A folder for display: `~` for home, and only the last two folders when it's long.
+fn short_dir(dir: &Path) -> String {
+    let home = dirs::home_dir();
+    let mut s = match home.as_deref().and_then(|h| dir.strip_prefix(h).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => dir.display().to_string(),
+    };
+    if s.chars().count() > 40 {
+        let parts: Vec<String> = dir.iter().map(|c| c.to_string_lossy().into_owned()).collect();
+        s = format!("…/{}", parts[parts.len().saturating_sub(2)..].join("/"));
+    }
+    s
 }
 
 fn open_in_file_manager(path: &Path) -> std::io::Result<std::process::Child> {

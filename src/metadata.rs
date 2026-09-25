@@ -68,6 +68,124 @@ const KEPT_TIFF_TAGS: [Tag; 9] = [
     Tag::ResolutionUnit,
 ];
 
+/// A photo's EXIF as readable sections for the Info tab: (section, [(label, value)]), plus the
+/// GPS position (latitude, longitude) when it has one.
+pub struct Summary {
+    pub sections: Vec<(&'static str, Vec<(&'static str, String)>)>,
+    pub location: Option<(f64, f64)>,
+}
+
+/// Reads and formats the metadata of `source` (any format we open).
+pub fn summary(source: &Path) -> Summary {
+    let ext = crate::import::extension(source).unwrap_or_default();
+    let fields = if crate::loader::RAW_EXTENSIONS.contains(&ext.as_str()) {
+        from_raw(source)
+    } else {
+        std::fs::File::open(source)
+            .ok()
+            .and_then(|f| exif::Reader::new().read_from_container(&mut std::io::BufReader::new(f)).ok())
+            .map(|e| e.fields().filter(|f| f.ifd_num == In::PRIMARY).cloned().collect())
+    }
+    .unwrap_or_default();
+    summarise(&fields)
+}
+
+fn summarise(fields: &[Field]) -> Summary {
+    let get = |t: Tag| fields.iter().find(|f| f.tag == t).map(|f| &f.value);
+    let text = |t: Tag| match get(t) {
+        Some(Value::Ascii(v)) => v.first().map(|s| String::from_utf8_lossy(s).trim().to_string()).filter(|s| !s.is_empty()),
+        _ => None,
+    };
+    let num = |t: Tag| match get(t) {
+        Some(Value::Rational(v)) => v.first().map(|r| r.to_f64()),
+        Some(Value::SRational(v)) => v.first().map(|r| r.to_f64()),
+        Some(v) => v.get_uint(0).map(f64::from),
+        None => None,
+    }
+    .filter(|n| n.is_finite());
+    let trim = |n: f64, digits: usize| {
+        let s = format!("{n:.digits$}");
+        if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s }
+    };
+
+    let mut camera = Vec::new();
+    match (text(Tag::Make), text(Tag::Model)) {
+        (Some(make), Some(model)) if model.to_lowercase().starts_with(&make.to_lowercase()) => camera.push(("Camera", model)),
+        (Some(make), Some(model)) => camera.push(("Camera", format!("{make} {model}"))),
+        (None, Some(model)) | (Some(model), None) => camera.push(("Camera", model)),
+        _ => {}
+    }
+    if let Some(lens) = text(Tag::LensModel) {
+        camera.push(("Lens", lens));
+    }
+
+    let mut exposure = Vec::new();
+    if let Some(t) = num(Tag::ExposureTime).filter(|t| *t > 0.0) {
+        exposure.push(("Shutter", if t < 1.0 { format!("1/{} s", (1.0 / t).round()) } else { format!("{} s", trim(t, 1)) }));
+    }
+    if let Some(f) = num(Tag::FNumber).filter(|f| *f > 0.0) {
+        exposure.push(("Aperture", format!("f/{}", trim(f, 1))));
+    }
+    if let Some(iso) = num(Tag::PhotographicSensitivity) {
+        exposure.push(("ISO", format!("{iso:.0}")));
+    }
+    if let Some(mm) = num(Tag::FocalLength).filter(|m| *m > 0.0) {
+        let equiv = num(Tag::FocalLengthIn35mmFilm).filter(|e| *e > 0.0).map(|e| format!(" ({e:.0} mm equiv.)")).unwrap_or_default();
+        exposure.push(("Focal length", format!("{} mm{equiv}", trim(mm, 1))));
+    }
+    if let Some(ev) = num(Tag::ExposureBiasValue).filter(|e| e.abs() > 0.01) {
+        exposure.push(("Exposure comp.", format!("{}{} EV", if ev > 0.0 { "+" } else { "" }, trim(ev, 1))));
+    }
+    if let Some(flash) = num(Tag::Flash) {
+        exposure.push(("Flash", if flash as u32 & 1 == 1 { "Fired".into() } else { "Off".into() }));
+    }
+
+    let mut taken = Vec::new();
+    if let Some(date) = text(Tag::DateTimeOriginal).or_else(|| text(Tag::DateTime)) {
+        taken.push(("Taken", pretty_date(&date)));
+    }
+
+    let coord = |value: Tag, reference: Tag| {
+        let Some(Value::Rational(dms)) = get(value) else { return None };
+        let deg = dms.iter().map(|r| r.to_f64()).zip([1.0, 60.0, 3600.0]).map(|(v, d)| v / d).sum::<f64>();
+        let sign = if matches!(text(reference).as_deref(), Some("S" | "W")) { -1.0 } else { 1.0 };
+        Some(deg * sign).filter(|d| d.is_finite())
+    };
+    let location = coord(Tag::GPSLatitude, Tag::GPSLatitudeRef).zip(coord(Tag::GPSLongitude, Tag::GPSLongitudeRef));
+    let mut place = Vec::new();
+    if let Some((lat, lon)) = location {
+        let (ns, ew) = (if lat < 0.0 { 'S' } else { 'N' }, if lon < 0.0 { 'W' } else { 'E' });
+        place.push(("Position", format!("{:.5}° {ns}, {:.5}° {ew}", lat.abs(), lon.abs())));
+        if let Some(alt) = num(Tag::GPSAltitude) {
+            let below = matches!(get(Tag::GPSAltitudeRef), Some(Value::Byte(b)) if b.first() == Some(&1));
+            place.push(("Altitude", format!("{}{alt:.0} m", if below { "-" } else { "" })));
+        }
+    }
+
+    let mut other = Vec::new();
+    for (label, tag) in [("Software", Tag::Software), ("Artist", Tag::Artist), ("Copyright", Tag::Copyright)] {
+        if let Some(v) = text(tag) {
+            other.push((label, v));
+        }
+    }
+
+    let sections = [("CAMERA", camera), ("EXPOSURE", exposure), ("DATE", taken), ("LOCATION", place), ("OTHER", other)]
+        .into_iter()
+        .filter(|(_, rows)| !rows.is_empty())
+        .collect();
+    Summary { sections, location }
+}
+
+/// "2025:08:14 19:02:11" → "14 Aug 2025, 19:02".
+fn pretty_date(exif: &str) -> String {
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let p: Vec<&str> = exif.split(|c: char| c == ':' || c == ' ').collect();
+    match (p.first(), p.get(1).and_then(|m| m.parse::<usize>().ok()), p.get(2), p.get(3), p.get(4)) {
+        (Some(y), Some(m @ 1..=12), Some(d), Some(h), Some(min)) => format!("{} {} {y}, {h}:{min}", d.trim_start_matches('0'), MONTHS[m - 1]),
+        _ => exif.to_string(),
+    }
+}
+
 /// JPEG, HEIC, PNG, WebP and TIFF.
 fn from_container(source: &Path) -> Option<Vec<Field>> {
     let file = std::fs::File::open(source).ok()?;
@@ -178,6 +296,32 @@ mod tests {
 
     /// A JPEG with orientation, GPS and a date: exported EXIF keeps the date and GPS (unless
     /// asked not to), drops the orientation and records the new size.
+    #[test]
+    fn summarises_exif_readably() {
+        let fields = [
+            field(Tag::Make, Value::Ascii(vec![b"Canon".to_vec()])),
+            field(Tag::Model, Value::Ascii(vec![b"Canon EOS R6".to_vec()])),
+            field(Tag::ExposureTime, Value::Rational(vec![Rational { num: 1, denom: 250 }])),
+            field(Tag::FNumber, Value::Rational(vec![Rational { num: 28, denom: 10 }])),
+            field(Tag::FocalLength, Value::Rational(vec![Rational { num: 70, denom: 1 }])),
+            field(Tag::DateTimeOriginal, Value::Ascii(vec![b"2025:08:04 19:02:11".to_vec()])),
+            field(Tag::GPSLatitudeRef, Value::Ascii(vec![b"S".to_vec()])),
+            field(Tag::GPSLatitude, Value::Rational(vec![Rational { num: 33, denom: 1 }, Rational { num: 30, denom: 1 }, Rational { num: 0, denom: 1 }])),
+            field(Tag::GPSLongitudeRef, Value::Ascii(vec![b"E".to_vec()])),
+            field(Tag::GPSLongitude, Value::Rational(vec![Rational { num: 151, denom: 1 }, Rational { num: 12, denom: 1 }, Rational { num: 0, denom: 1 }])),
+        ];
+        let s = summarise(&fields);
+        let rows: Vec<(&str, String)> = s.sections.iter().flat_map(|(_, r)| r.clone()).collect();
+        let get = |l: &str| rows.iter().find(|(k, _)| *k == l).map(|(_, v)| v.as_str());
+        assert_eq!(get("Camera"), Some("Canon EOS R6"));
+        assert_eq!(get("Shutter"), Some("1/250 s"));
+        assert_eq!(get("Aperture"), Some("f/2.8"));
+        assert_eq!(get("Focal length"), Some("70 mm"));
+        assert_eq!(get("Taken"), Some("4 Aug 2025, 19:02"));
+        let (lat, lon) = s.location.unwrap();
+        assert!((lat + 33.5).abs() < 1e-9 && (lon - 151.2).abs() < 1e-9);
+    }
+
     #[test]
     fn rewrites_exif_for_export() {
         let src = [

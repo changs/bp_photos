@@ -7,6 +7,8 @@ mod filmstrip;
 mod gpu;
 mod import;
 mod loader;
+#[cfg(target_os = "macos")]
+mod macos;
 mod metadata;
 mod packs;
 mod palette;
@@ -35,6 +37,8 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     let initial = args.first().map(std::path::PathBuf::from);
+    #[cfg(target_os = "macos")]
+    macos::install();
 
     let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
     setup.device_descriptor = Arc::new(|adapter| {

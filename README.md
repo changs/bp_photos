@@ -10,21 +10,22 @@ pick one, export. It's the preset browser from Lightroom and nothing else.
 Rust + egui + wgpu. Everything runs on the GPU, so the preview and all thumbnails update instantly.
 Works on macOS and Linux.
 
-![bp_photos with a photo and the presets recommended for it](docs/screenshot.jpg)
+![Split view comparing the original with a recommended preset](docs/screenshot.jpg)
 
-![Before/after comparison with the folder's filmstrip below](docs/screenshot-compare.jpg)
+![Before/after side by side, the folder's filmstrip, and the Info tab](docs/screenshot-compare.jpg)
 
 ## Features
 
 - Opens JPEG, PNG, TIFF, WebP, HEIC/AVIF and camera RAW (CR2/CR3, NEF, ARW, RAF, DNG, …).
   HEIC and RAW show their embedded preview first, then the full image.
-- Reads Lightroom presets (`.xmp`, `.lrtemplate`) and `.cube` LUTs. Drop them on the window or use
-  *Import presets*; they're kept in `~/Library/Application Support/bp_photos/presets`
+  On macOS it's in Finder's *Open With* menu for photos (without taking over as the default app).
+- Reads Lightroom presets (`.xmp`, `.lrtemplate`) and `.cube` LUTs. Drop them on the window, or use
+  *Import Presets* in the command palette or the Presets menu; they're kept in `~/Library/Application Support/bp_photos/presets`
   (`~/.config/bp_photos/presets` on Linux), one group per folder.
 - Suggests about a dozen presets per photo. Every preset is rendered small and scored for clipping,
   exposure, contrast, saturation and skin tones; hover a suggestion to see why it was picked.
-- Amount slider (0–150%), or scroll over the photo.
-- Before/after view, or hold the mouse on the photo to see the original. Zoom to 100% to check
+- Amount slider (0–150%) under the presets, or scroll over the photo.
+- Split view with a draggable divider, a side-by-side before/after, or hold the mouse on the photo to see the original. Zoom to 100% to check
   grain and sharpness.
 - Step through the photos in a folder; the next and previous ones are decoded in the background.
   An optional filmstrip shows the whole folder, using the thumbnails already embedded in the files.
@@ -75,13 +76,17 @@ It builds libheif with only its decoders, so no GPL encoder code ends up in the 
 | `Shift+⌘P` or `⌘K` | command palette |
 | `⌘O` / `Shift+⌘O` | open a photo / a folder (opens its first photo, with the filmstrip) |
 | arrows | move through presets |
+| `⌘1`–`⌘9` | apply the 1st–9th recommended preset |
+| `/` | search presets |
+| `I` | Info tab: file, camera, lens, exposure, date and location of the photo |
 | `[` / `]` | previous / next photo in the folder (preloaded, so it's instant) |
 | `F` | filmstrip |
 | `Z` or double-click | 100% view, drag to pan (both sides in before/after) |
 | pinch, or `⌘`/`Ctrl` + scroll | zoom from fit to 800% around the pointer |
 | scroll | change amount |
 | `\` (hold) | show original |
-| `Y` | before / after |
+| `S` | split view: original and edit either side of a divider (drag it) |
+| `Y` | before / after side by side |
 | `C` | crop (`X` rotates the ratio, `Enter` applies, `Esc` cancels) |
 | `⌘E` / `Ctrl+E` | export |
 | `⌘S` / `Ctrl+S` | quick export: full size, next to the original as `name-edited.ext`, same format (HEIC/RAW → JPEG) |
