@@ -70,6 +70,9 @@ cargo run --release -- photo.jpg
 
 `rust-toolchain.toml` pins the Rust version; rustup installs it on first build.
 
+libheif 1.17 or later is needed, so Ubuntu 24.04, Debian 13 and later are fine; older ones
+(Ubuntu 22.04, Debian 12) ship a libheif too old to build against.
+
 You also need a working Vulkan driver (`mesa` covers Intel and AMD; `nvidia-utils` or equivalent
 for NVIDIA). wgpu falls back to OpenGL if there's no Vulkan, but the previews are slower.
 
