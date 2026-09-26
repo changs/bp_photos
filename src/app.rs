@@ -111,6 +111,15 @@ struct LoadResult {
     quick: bool,
 }
 
+/// What a file dialog came back with. The dialog runs off the UI thread (see `run_dialog`), so
+/// the result arrives as a message and is applied on a later frame.
+enum DialogOutcome {
+    Open(PathBuf),
+    OpenFolder(PathBuf),
+    ImportPresets(Vec<PathBuf>),
+    Export(export::Plan, PathBuf),
+}
+
 pub struct PhotoApp {
     gpu: Gpu,
     renderer: std::sync::Arc<egui::mutex::RwLock<eframe::egui_wgpu::Renderer>>,
@@ -123,6 +132,8 @@ pub struct PhotoApp {
     exporting: Option<Receiver<Result<PathBuf, String>>>,
     /// "Get Free Presets" in progress: status updates, then the number of files installed.
     downloading: Option<Receiver<Result<String, Result<usize, String>>>>,
+    /// A file dialog waiting on the user, off the UI thread. See `run_dialog`.
+    dialog: Option<Receiver<DialogOutcome>>,
     /// Extra detail for the "Exported …" status (e.g. a format change on Quick Export).
     export_note: Option<String>,
     /// Resized RGBA image on its way to the clipboard.
@@ -235,6 +246,7 @@ impl PhotoApp {
             exporting: None,
             export_note: None,
             downloading: None,
+            dialog: None,
             copying: None,
             clipboard: None,
             status: match &look {
@@ -531,33 +543,27 @@ impl PhotoApp {
         use crate::palette::Command;
         match command {
             Command::OpenFile => {
-                let mut exts: Vec<&str> = loader::IMAGE_EXTENSIONS.to_vec();
+                let mut exts: Vec<&'static str> = loader::IMAGE_EXTENSIONS.to_vec();
                 exts.extend(loader::HEIF_EXTENSIONS);
                 exts.extend(loader::RAW_EXTENSIONS);
-                if let Some(path) = rfd::FileDialog::new().add_filter("Photos", &exts).pick_file() {
-                    self.open(path, ctx);
-                }
+                self.run_dialog(ctx, move || {
+                    rfd::FileDialog::new().add_filter("Photos", &exts).pick_file().map(DialogOutcome::Open)
+                });
             }
             Command::OpenFolder => {
-                let Some(dir) = rfd::FileDialog::new().pick_folder() else { return };
-                match crate::browse::list_photos(&dir).into_iter().next() {
-                    Some(first) => {
-                        self.open(first, ctx);
-                        self.set_filmstrip(ctx, true);
-                    }
-                    None => self.status = format!("No photos in {}", dir.display()),
-                }
+                self.run_dialog(ctx, || rfd::FileDialog::new().pick_folder().map(DialogOutcome::OpenFolder));
             }
             Command::QuickExport => self.quick_export(),
             Command::ImportPresetFiles => {
-                if let Some(files) = rfd::FileDialog::new().add_filter("Presets", &import::PRESET_EXTENSIONS).pick_files() {
-                    self.import_paths(files);
-                }
+                self.run_dialog(ctx, || {
+                    let dialog = rfd::FileDialog::new().add_filter("Presets", &import::PRESET_EXTENSIONS);
+                    dialog.pick_files().map(DialogOutcome::ImportPresets)
+                });
             }
             Command::ImportPresetFolder => {
-                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                    self.import_paths(vec![dir]);
-                }
+                self.run_dialog(ctx, || {
+                    rfd::FileDialog::new().pick_folder().map(|dir| DialogOutcome::ImportPresets(vec![dir]))
+                });
             }
             Command::ShowPresetsFolder => {
                 _ = std::fs::create_dir_all(&self.presets_dir);
@@ -1190,7 +1196,7 @@ impl PhotoApp {
         }
         if go {
             self.export_dialog = false;
-            self.export(plan);
+            self.export(plan, ctx);
         }
         if copy {
             self.export_dialog = false;
@@ -1221,7 +1227,7 @@ impl PhotoApp {
         }
     }
 
-    fn export(&mut self, plan: export::Plan) {
+    fn export(&mut self, plan: export::Plan, ctx: &egui::Context) {
         let Some(photo) = &self.photo else { return };
         let st = &self.export_settings;
         let preset = &self.presets[self.selected];
@@ -1232,14 +1238,11 @@ impl PhotoApp {
             "custom" => format!(" - {}px", plan.output.0.max(plan.output.1)),
             slug => format!(" - {slug}"),
         };
-        let Some(dest) = rfd::FileDialog::new()
-            .set_file_name(format!("{stem} - {}{suffix}.{ext}", preset.name))
-            .add_filter(format, &[ext])
-            .save_file()
-        else {
-            return;
-        };
-        self.write_export(plan, dest);
+        let name = format!("{stem} - {}{suffix}.{ext}", preset.name);
+        self.run_dialog(ctx, move || {
+            let dialog = rfd::FileDialog::new().set_file_name(name).add_filter(format, &[ext]);
+            dialog.save_file().map(|dest| DialogOutcome::Export(plan, dest))
+        });
     }
 
     /// Downloads the free preset packs into the presets folder, then loads the new ones.
@@ -1325,7 +1328,66 @@ impl PhotoApp {
         }
     }
 
+    /// Shows a file dialog and hands the result to `poll_dialog`.
+    ///
+    /// Everywhere but macOS the dialog runs on its own thread. rfd's dialogs block until the user
+    /// is done, and on Linux that is a round trip to a separate xdg-desktop-portal process: on the
+    /// UI thread it would stop the event loop from pumping for as long as the dialog is open, and
+    /// the compositor reports the window as not responding. macOS keeps the direct call, where the
+    /// modal panel runs the app's own run loop and so stays responsive on its own.
+    fn run_dialog(&mut self, ctx: &egui::Context, show: impl FnOnce() -> Option<DialogOutcome> + Send + 'static) {
+        #[cfg(target_os = "macos")]
+        if let Some(outcome) = show() {
+            self.apply_dialog(outcome, ctx);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // One at a time: a second dialog would open behind the first with nothing to show it.
+            if self.dialog.is_some() {
+                return;
+            }
+            let (tx, rx) = channel();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                // Cancelling sends nothing and drops `tx`, which `poll_dialog` reads as a cancel.
+                if let Some(outcome) = show() {
+                    _ = tx.send(outcome);
+                }
+                ctx.request_repaint();
+            });
+            self.dialog = Some(rx);
+        }
+    }
+
+    fn poll_dialog(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.dialog else { return };
+        match rx.try_recv() {
+            Ok(outcome) => {
+                self.dialog = None;
+                self.apply_dialog(outcome, ctx);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.dialog = None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    fn apply_dialog(&mut self, outcome: DialogOutcome, ctx: &egui::Context) {
+        match outcome {
+            DialogOutcome::Open(path) => self.open(path, ctx),
+            DialogOutcome::OpenFolder(dir) => match crate::browse::list_photos(&dir).into_iter().next() {
+                Some(first) => {
+                    self.open(first, ctx);
+                    self.set_filmstrip(ctx, true);
+                }
+                None => self.status = format!("No photos in {}", dir.display()),
+            },
+            DialogOutcome::ImportPresets(paths) => self.import_paths(paths),
+            DialogOutcome::Export(plan, dest) => self.write_export(plan, dest),
+        }
+    }
+
     fn poll_background(&mut self, ctx: &egui::Context) {
+        self.poll_dialog(ctx);
         if let Some((path, result)) = self.browser.poll() {
             match result {
                 Ok(decoded) => self.finish_load(path, decoded, Instant::now(), false),
