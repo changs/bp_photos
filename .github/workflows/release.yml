@@ -1,5 +1,8 @@
 # Builds the macOS app and attaches the .dmg to a GitHub release when a version tag is pushed
 # (git tag v0.1.0 && git push origin v0.1.0). Run it by hand to just get the .dmg as an artifact.
+#
+# The linux job doesn't ship anything: it's there so a release can't claim Linux support without
+# the app having compiled and run its tests there.
 name: Release
 
 on:
@@ -39,3 +42,25 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" dist/*.dmg --title "$GITHUB_REF_NAME" --generate-notes
+
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libheif-dev pkg-config libxkbcommon-dev libwayland-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build and test
+        run: |
+          cargo build --release
+          cargo test --release
+
+      - name: Check the desktop entry
+        run: |
+          sudo apt-get install -y desktop-file-utils
+          desktop-file-validate assets/bp_photos.desktop

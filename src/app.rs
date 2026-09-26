@@ -624,7 +624,7 @@ impl PhotoApp {
                 folder_icon(ui);
                 let folder = ui
                     .add(egui::Label::new(small(short_dir(&dir))).sense(Sense::click()))
-                    .on_hover_text(format!("{}\nClick to show in Finder", dir.display()));
+                    .on_hover_text(format!("{}\nClick to show in {}", dir.display(), file_manager_name()));
                 if folder.clicked() {
                     _ = open_in_file_manager(&dir);
                 }
@@ -2296,6 +2296,11 @@ fn short_dir(dir: &Path) -> String {
         s = format!("…/{}", parts[parts.len().saturating_sub(2)..].join("/"));
     }
     s
+}
+
+/// What to call the file manager in tooltips.
+fn file_manager_name() -> &'static str {
+    if cfg!(target_os = "macos") { "Finder" } else if cfg!(windows) { "Explorer" } else { "the file manager" }
 }
 
 fn open_in_file_manager(path: &Path) -> std::io::Result<std::process::Child> {

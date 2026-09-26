@@ -18,7 +18,8 @@ Works on macOS and Linux.
 
 - Opens JPEG, PNG, TIFF, WebP, HEIC/AVIF and camera RAW (CR2/CR3, NEF, ARW, RAF, DNG, …).
   HEIC and RAW show their embedded preview first, then the full image.
-  On macOS it's in Finder's *Open With* menu for photos (without taking over as the default app).
+  It's in Finder's *Open With* menu for photos on macOS, and the file manager's on Linux once
+  `scripts/install-linux.sh` has run — in neither case taking over as the default app.
 - Reads Lightroom presets (`.xmp`, `.lrtemplate`) and `.cube` LUTs. Drop them on the window, or use
   *Import Presets* in the command palette or the Presets menu; they're kept in `~/Library/Application Support/bp_photos/presets`
   (`~/.config/bp_photos/presets` on Linux), one group per folder.
@@ -53,19 +54,32 @@ The app isn't notarised by Apple, so the first time macOS will refuse to open it
 from System Settings → Privacy & Security → *Open Anyway*, or run
 `xattr -dr com.apple.quarantine "/Applications/BP Photos.app"`.
 
+On Linux there's no prebuilt package: install the build dependencies below and run
+`scripts/install-linux.sh`. Wayland and X11 both work.
+
 ## Build
 
 ```sh
 brew install libheif pkgconf        # macOS
 sudo apt install libheif-dev pkg-config libxkbcommon-dev libwayland-dev libvulkan1   # Debian/Ubuntu
+sudo pacman -S libheif pkgconf libxkbcommon wayland vulkan-icd-loader                # Arch
+sudo dnf install libheif-devel pkgconf-pkg-config libxkbcommon-devel wayland-devel vulkan-loader  # Fedora
 
 cargo run --release -- photo.jpg
 ```
 
 `rust-toolchain.toml` pins the Rust version; rustup installs it on first build.
 
+You also need a working Vulkan driver (`mesa` covers Intel and AMD; `nvidia-utils` or equivalent
+for NVIDIA). wgpu falls back to OpenGL if there's no Vulkan, but the previews are slower.
+
 `scripts/bundle-macos.sh` makes `dist/BP Photos.app` and a `.dmg` (needs `brew install cmake meson ninja`).
 It builds libheif with only its decoders, so no GPL encoder code ends up in the app.
+
+`scripts/install-linux.sh` builds the app and installs it into `~/.local` with its icon and
+`bp_photos.desktop`, so it shows up in the launcher and in the file manager's *Open With* menu for
+photos — like the macOS bundle, without becoming the default handler. Pass `--prefix /usr/local`
+(as root) for a system-wide install.
 
 ## Keys
 

@@ -55,11 +55,19 @@ fn main() -> eframe::Result {
         }
     });
 
+    #[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(unused_mut))]
+    let mut viewport = egui::ViewportBuilder::default().with_title("BP Photos");
+    // Wayland app_id / X11 WM_CLASS, so the running window is matched with bp_photos.desktop and
+    // picks up its icon in the taskbar. Not set on macOS, where it would only move the state file.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        viewport = viewport.with_app_id("bp_photos");
+    }
+
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: egui_wgpu::WgpuConfiguration { wgpu_setup: egui_wgpu::WgpuSetup::CreateNew(setup), ..Default::default() },
-        viewport: egui::ViewportBuilder::default()
-            .with_title("BP Photos")
+        viewport: viewport
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([800.0, 500.0])
             .with_drag_and_drop(true)
